@@ -816,6 +816,11 @@ def _remove_isolated_worktree(root: Path, repo: Path, worker: Path):
 
 
 def test_external_real_gateway_turns_have_distinct_operations_and_zero_child_tools(tmp_path):
+    candidate_root = Path(__file__).resolve().parents[2]
+    expected_candidate_commit = subprocess.run(
+        ["git", "-C", str(candidate_root), "rev-parse", "HEAD"],
+        check=True, text=True, capture_output=True, timeout=10,
+    ).stdout.strip()
     root, repo, worker, env = _prepare_isolated_root(tmp_path)
     completed = None
     try:
@@ -865,7 +870,7 @@ def test_external_real_gateway_turns_have_distinct_operations_and_zero_child_too
         assert Path(receipt["candidate_module"]).is_relative_to(
             Path(__file__).resolve().parents[2]
         )
-        assert receipt["candidate_commit"] == "20369cba1ad707cf926ba378db297728906fb9ca"
+        assert receipt["candidate_commit"] == expected_candidate_commit
         assert receipt["parent_prompt_stable"] and receipt["parent_schema_stable"]
         assert receipt["parent_models"] == ["parent-model"]
         assert receipt["child_models"] == ["worker-model"]
