@@ -253,7 +253,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     }
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
@@ -265,7 +265,40 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              owner_started_at, json.dumps(task_payload),
              record.get("origin_session_id", "")),
         )
-    _prune_durable_records()
+    try:
+        _prune_durable_records()
+    except Exception:
+        # The dispatch row is authoritative once INSERT commits. Retention
+        # maintenance must not turn that success into an ambiguous retry.
+        logger.exception("Failed to prune durable async delegation records")
+
+
+def _durable_delegation_exists(delegation_id: str) -> bool:
+    with _DB_LOCK, _transaction() as conn:
+        return conn.execute(
+            "SELECT 1 FROM async_delegations WHERE delegation_id=? LIMIT 1",
+            (delegation_id,),
+        ).fetchone() is not None
+
+
+def _reserve_dispatch_record(record: Dict[str, Any]) -> bool:
+    """Reserve an id across memory and durable state without replacement."""
+    delegation_id = str(record["delegation_id"])
+    with _records_lock:
+        if delegation_id in _records or _durable_delegation_exists(delegation_id):
+            return False
+        _records[delegation_id] = record
+        return True
+
+
+def _pop_dispatch_record(delegation_id: str, run_token: object) -> bool:
+    """Remove only the exact run that owns ``delegation_id``."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None or record.get("_run_token") is not run_token:
+            return False
+        _records.pop(delegation_id, None)
+        return True
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
@@ -712,7 +745,7 @@ def _prune_completed_locked() -> None:
     completed = [
         (rid, r)
         for rid, r in _records.items()
-        if r.get("status") != "running"
+        if r.get("status") not in {"running", "stalling", "finalizing"}
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -765,6 +798,9 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    enforce_spawn_controls: bool,
+    parent_depth: Optional[int] = None,
+    max_spawn_depth: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -808,8 +844,11 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    from tools.delegation_admission import try_admit_background_unit
+
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
+    run_token = object()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": goal,
@@ -831,30 +870,45 @@ def dispatch_async_delegation(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "_run_token": run_token,
     }
-    # Capacity check and record insert under ONE lock hold — checking
-    # active_count() separately would let two concurrent dispatches (e.g.
-    # from different gateway sessions) both pass the check and exceed the cap.
-    with _records_lock:
-        running = sum(
-            1 for r in _records.values()
-            if r.get("status") in ("running", "stalling")
+    admission = try_admit_background_unit(
+        max_async_children,
+        enforce_pause=enforce_spawn_controls,
+        parent_depth=parent_depth,
+        max_spawn_depth=max_spawn_depth,
+    )
+    if not admission.admitted:
+        code = admission.rejection_code
+        error = (
+            f"Async delegation capacity reached ({max_async_children} running). "
+            "Wait for one to finish (its result will re-enter the chat), or "
+            "run this task synchronously (background=false). Raise "
+            "delegation.max_concurrent_children in config.yaml to allow more "
+            "concurrent background subagents."
+            if code == "CAPACITY_REACHED"
+            else f"Async delegation rejected by host admission: {code}."
         )
-        if running >= max_async_children:
-            return {
-                "status": "rejected",
-                "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
-                    f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or run this task synchronously "
-                    f"(background=false). Raise delegation.max_concurrent_children in "
-                    f"config.yaml to allow more concurrent background subagents."
-                ),
-            }
-        _records[delegation_id] = record
-
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
+        return {"status": "rejected", "rejection_code": code, "error": error}
+    lease = admission.lease
+    record["_admission_lease"] = lease
+    try:
+        reserved = _reserve_dispatch_record(record)
+    except Exception as exc:
+        if lease is not None:
+            lease.release()
+        return {
+            "status": "rejected",
+            "error": f"Failed to reserve async delegation id: {exc}",
+        }
+    if not reserved:
+        if lease is not None:
+            lease.release()
+        return {
+            "status": "rejected",
+            "rejection_code": "DUPLICATE_DELEGATION_ID",
+            "error": "Async delegation id is already reserved.",
+        }
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -873,16 +927,25 @@ def dispatch_async_delegation(
             }
             status = "error"
         finally:
-            _finalize(delegation_id, result, status)
+            _finalize(delegation_id, run_token, result, status)
 
+    persisted = False
     try:
+        _persist_dispatch(record)
+        persisted = True
+        executor = _get_executor(max_async_children)
         # Propagate the dispatching profile so the detached child resolves
         # get_hermes_home() under the right profile.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _pop_dispatch_record(delegation_id, run_token)
+        if persisted:
+            try:
+                _delete_durable_delegation(delegation_id)
+            except Exception:
+                logger.exception("Failed to clean rejected delegation %s", delegation_id)
+        if lease is not None:
+            lease.release()
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -897,24 +960,36 @@ def dispatch_async_delegation(
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
-def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
+def _finalize(
+    delegation_id: str,
+    run_token: object,
+    result: Dict[str, Any],
+    status: str,
+) -> None:
     """Mark a record complete and push the completion event onto the queue."""
-    claimed = _begin_finalization(delegation_id)
+    claimed = _begin_finalization(delegation_id, run_token)
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_completion_event(event_record, result, status)
+    finally:
+        _finish_finalization(delegation_id, run_token, status)
 
 
 def _begin_finalization(
     delegation_id: str,
+    run_token: object,
 ) -> Optional[tuple[Dict[str, Any], Optional[Callable[[], None]]]]:
     """Atomically claim terminal delivery while keeping the record active."""
     with _records_lock:
         record = _records.get(delegation_id)
-        if record is None or record.get("status") not in ("running", "stalling"):
+        if (
+            record is None
+            or record.get("_run_token") is not run_token
+            or record.get("status") not in ("running", "stalling")
+        ):
             return
         # Stay active until durable persistence and queue publication finish;
         # otherwise process shutdown can kill this daemon worker in the narrow
@@ -929,12 +1004,20 @@ def _begin_finalization(
     return event_record, interrupt_fn
 
 
-def _finish_finalization(delegation_id: str, status: str) -> None:
-    with _records_lock:
-        record = _records.get(delegation_id)
-        if record is not None:
-            record["status"] = status
-        _prune_completed_locked()
+def _finish_finalization(
+    delegation_id: str, run_token: object, status: str
+) -> None:
+    lease = None
+    try:
+        with _records_lock:
+            record = _records.get(delegation_id)
+            if record is not None and record.get("_run_token") is run_token:
+                record["status"] = status
+                lease = record.pop("_admission_lease", None)
+            _prune_completed_locked()
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 def _push_completion_event(
@@ -1028,6 +1111,9 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    enforce_spawn_controls: bool,
+    parent_depth: Optional[int] = None,
+    max_spawn_depth: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1049,9 +1135,12 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    from tools.delegation_admission import try_admit_background_unit
+
+    n = len(goals)
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
-    n = len(goals)
+    run_token = object()
     # A combined goal label for status listings / the completion header.
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
@@ -1078,26 +1167,47 @@ def dispatch_async_delegation_batch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "_run_token": run_token,
     }
-    with _records_lock:
-        running = sum(
-            1 for r in _records.values()
-            if r.get("status") in ("running", "stalling")
+    admission = try_admit_background_unit(
+        max_async_children,
+        enforce_pause=enforce_spawn_controls,
+        parent_depth=parent_depth,
+        max_spawn_depth=max_spawn_depth,
+        batch_size=n,
+        batch_enabled=True,
+        max_batch_size=max_async_children,
+    )
+    if not admission.admitted:
+        code = admission.rejection_code
+        error = (
+            f"Async delegation capacity reached ({max_async_children} running). "
+            "Wait for one to finish (its result will re-enter the chat), or "
+            "raise delegation.max_concurrent_children in config.yaml to allow "
+            "more concurrent background units."
+            if code == "CAPACITY_REACHED"
+            else f"Async delegation batch rejected by host admission: {code}."
         )
-        if running >= max_async_children:
-            return {
-                "status": "rejected",
-                "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
-                    f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or raise delegation.max_concurrent_children in "
-                    f"config.yaml to allow more concurrent background units."
-                ),
-            }
-        _records[delegation_id] = record
-
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
+        return {"status": "rejected", "rejection_code": code, "error": error}
+    lease = admission.lease
+    record["_admission_lease"] = lease
+    try:
+        reserved = _reserve_dispatch_record(record)
+    except Exception as exc:
+        if lease is not None:
+            lease.release()
+        return {
+            "status": "rejected",
+            "error": f"Failed to reserve async delegation id: {exc}",
+        }
+    if not reserved:
+        if lease is not None:
+            lease.release()
+        return {
+            "status": "rejected",
+            "rejection_code": "DUPLICATE_DELEGATION_ID",
+            "error": "Async delegation id is already reserved.",
+        }
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
@@ -1122,15 +1232,24 @@ def dispatch_async_delegation_batch(
             }
             status = "error"
         finally:
-            _finalize_batch(delegation_id, combined, status)
+            _finalize_batch(delegation_id, run_token, combined, status)
 
+    persisted = False
     try:
+        _persist_dispatch(record)
+        persisted = True
+        executor = _get_executor(max_async_children)
         # Propagate the dispatching profile to the detached batch children.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _pop_dispatch_record(delegation_id, run_token)
+        if persisted:
+            try:
+                _delete_durable_delegation(delegation_id)
+            except Exception:
+                logger.exception("Failed to clean rejected batch %s", delegation_id)
+        if lease is not None:
+            lease.release()
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -1146,16 +1265,21 @@ def dispatch_async_delegation_batch(
 
 
 def _finalize_batch(
-    delegation_id: str, combined: Dict[str, Any], status: str
+    delegation_id: str,
+    run_token: object,
+    combined: Dict[str, Any],
+    status: str,
 ) -> None:
     """Mark a batch record complete and push ONE combined completion event."""
-    claimed = _begin_finalization(delegation_id)
+    claimed = _begin_finalization(delegation_id, run_token)
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_batch_completion_event(event_record, combined, status)
+    finally:
+        _finish_finalization(delegation_id, run_token, status)
 
 
 def _push_batch_completion_event(
@@ -1265,8 +1389,8 @@ def _stale_monitor_loop() -> None:
     """
     while not _monitor_stop.wait(_STALE_CHECK_INTERVAL):
         now = time.time()
-        stalled: List[tuple] = []  # (delegation_id, is_batch, quiet_for, in_tool)
-        expired: List[str] = []  # stalling past grace → force-finalize
+        stalled: List[tuple] = []  # (id, run_token, is_batch, quiet_for, in_tool)
+        expired: List[tuple[str, object]] = []  # exact run past grace
         any_monitorable = False
         with _records_lock:
             for record in _records.values():
@@ -1275,7 +1399,9 @@ def _stale_monitor_loop() -> None:
                     any_monitorable = True
                     interrupted_at = record.get("_interrupted_at") or now
                     if now - interrupted_at >= _STALL_GRACE_SECONDS:
-                        expired.append(record["delegation_id"])
+                        expired.append(
+                            (record["delegation_id"], record["_run_token"])
+                        )
                     continue
                 if status != "running":
                     continue
@@ -1310,12 +1436,13 @@ def _stale_monitor_loop() -> None:
                     stalled.append(
                         (
                             record["delegation_id"],
+                            record["_run_token"],
                             bool(record.get("is_batch")),
                             quiet_for,
                             in_tool,
                         )
                     )
-        for delegation_id, _is_batch, quiet_for, in_tool in stalled:
+        for delegation_id, run_token, _is_batch, quiet_for, in_tool in stalled:
             logger.warning(
                 "Async delegation %s made no progress for %.0fs "
                 "(in_tool=%s) — interrupting; grace window %.0fs",
@@ -1323,7 +1450,11 @@ def _stale_monitor_loop() -> None:
             )
             with _records_lock:
                 record = _records.get(delegation_id)
-                fn = record.get("interrupt_fn") if record else None
+                fn = (
+                    record.get("interrupt_fn")
+                    if record and record.get("_run_token") is run_token
+                    else None
+                )
             if callable(fn):
                 try:
                     fn()
@@ -1332,15 +1463,15 @@ def _stale_monitor_loop() -> None:
                         "Async delegation %s stall interrupt failed: %s",
                         delegation_id, exc,
                     )
-        for delegation_id in expired:
-            _finalize_stalled(delegation_id)
+        for delegation_id, run_token in expired:
+            _finalize_stalled(delegation_id, run_token)
         if not any_monitorable:
             return
 
 
-def _finalize_stalled(delegation_id: str) -> None:
+def _finalize_stalled(delegation_id: str, run_token: object) -> None:
     """Force-finalize a stalling delegation whose runner never returned."""
-    claimed = _begin_finalization(delegation_id)
+    claimed = _begin_finalization(delegation_id, run_token)
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
@@ -1380,32 +1511,34 @@ def _finalize_stalled(delegation_id: str) -> None:
         ),
         "stall_grace_seconds": _STALL_GRACE_SECONDS,
     }
-    if event_record.get("is_batch"):
-        _push_batch_completion_event(
-            event_record,
-            {
-                "results": [],
-                "error": error,
-                "total_duration_seconds": duration,
-                **stall_meta,
-            },
-            "stalled",
-        )
-    else:
-        _push_completion_event(
-            event_record,
-            {
-                "status": "stalled",
-                "summary": None,
-                "error": error,
-                "api_calls": 0,
-                "duration_seconds": duration,
-                "exit_reason": "stalled",
-                **stall_meta,
-            },
-            "stalled",
-        )
-    _finish_finalization(delegation_id, "stalled")
+    try:
+        if event_record.get("is_batch"):
+            _push_batch_completion_event(
+                event_record,
+                {
+                    "results": [],
+                    "error": error,
+                    "total_duration_seconds": duration,
+                    **stall_meta,
+                },
+                "stalled",
+            )
+        else:
+            _push_completion_event(
+                event_record,
+                {
+                    "status": "stalled",
+                    "summary": None,
+                    "error": error,
+                    "api_calls": 0,
+                    "duration_seconds": duration,
+                    "exit_reason": "stalled",
+                    **stall_meta,
+                },
+                "stalled",
+            )
+    finally:
+        _finish_finalization(delegation_id, run_token, "stalled")
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
@@ -1599,5 +1732,12 @@ def _reset_for_tests() -> None:
         _monitor_thread = None
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
+    leases = []
     with _records_lock:
+        leases = [
+            record.pop("_admission_lease", None) for record in _records.values()
+        ]
         _records.clear()
+    for lease in leases:
+        if lease is not None:
+            lease.release()

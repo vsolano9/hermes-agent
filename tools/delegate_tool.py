@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 
 import enum
 import contextvars
+import dataclasses
 import json
 import logging
 import re
@@ -44,6 +45,25 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+_REASONING_OVERRIDE_UNSET = object()
+_NATIVE_READ_ONLY_API_MODES = frozenset(
+    {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
+)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _NativeReadOnlyTransportReceipt:
+    """Bounded host-private proof used only for v2 exact-empty launches."""
+
+    provider: str
+    model: str
+    transport: str
+    hermes_model_tools_empty: bool
+    independent_mutation_channels: frozenset[str]
+    eligible: bool
+    reason: str
 
 
 # Tools that children must never have access to
@@ -144,9 +164,6 @@ _MIN_SPAWN_DEPTH = 1
 # process, including nested orchestrator -> worker chains.
 # ---------------------------------------------------------------------------
 
-_spawn_pause_lock = threading.Lock()
-_spawn_paused: bool = False
-
 _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
@@ -197,15 +214,15 @@ def set_spawn_paused(paused: bool) -> bool:
     Active children keep running; only NEW calls to delegate_task fail fast
     with a "spawning paused" error until unblocked.  Returns the new state.
     """
-    global _spawn_paused
-    with _spawn_pause_lock:
-        _spawn_paused = bool(paused)
-        return _spawn_paused
+    from tools.delegation_admission import set_spawn_paused as _set
+
+    return _set(paused)
 
 
 def is_spawn_paused() -> bool:
-    with _spawn_pause_lock:
-        return _spawn_paused
+    from tools.delegation_admission import is_spawn_paused as _is_paused
+
+    return _is_paused()
 
 
 def _register_subagent(record: Dict[str, Any]) -> None:
@@ -1622,10 +1639,20 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Host-owned lifecycle routing can resolve an authoritative bundle whose
+    # empty fields must never fall through to the parent's credentials or ACP
+    # transport. Legacy delegation keeps its historical truthy inheritance.
+    authoritative_route_overrides: bool = False,
+    # Host-owned parsed reasoning override. The sentinel preserves the
+    # existing delegation-config > parent precedence for every legacy caller.
+    override_reasoning_config: Any = _REASONING_OVERRIDE_UNSET,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Host-only contract used by lifecycle v2. False preserves every legacy
+    # caller's historical None/empty inheritance semantics.
+    exact_toolsets: bool = False,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1680,7 +1707,13 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    if exact_toolsets:
+        # Exact host policy is authoritative, including an empty zero-tool
+        # set. Do not preserve MCP toolsets or re-add role capabilities.
+        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+        child_toolsets = [t for t in (toolsets or []) if t in expanded_parent]
+        child_toolsets = _strip_blocked_tools(child_toolsets)
+    elif toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
@@ -1708,7 +1741,7 @@ def _build_child_agent(
         inherited_disabled = [str(name) for name in raw_parent_disabled]
     else:
         inherited_disabled = []
-    if effective_role == "orchestrator":
+    if effective_role == "orchestrator" and not exact_toolsets:
         # Role grants delegate_task explicitly, matching the unconditional
         # delegation toolset re-add below.
         inherited_disabled = [
@@ -1716,7 +1749,10 @@ def _build_child_agent(
         ]
     child_disabled_toolsets = list(
         dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
+            inherited_disabled
+            + _blocked_toolsets_for_role(effective_role)
+            + (["delegation"] if exact_toolsets else [])
+            + ["kanban"]
         )
     )
 
@@ -1724,7 +1760,11 @@ def _build_child_agent(
     # removed.  The re-add is unconditional on parent-toolset membership because
     # orchestrator capability is granted by role, not inherited — see the
     # test_intersection_preserves_delegation_bound test for the design rationale.
-    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
+    if (
+        not exact_toolsets
+        and effective_role == "orchestrator"
+        and "delegation" not in child_toolsets
+    ):
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
@@ -1781,11 +1821,16 @@ def _build_child_agent(
 
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    if not override_base_url:
+    if authoritative_route_overrides:
+        effective_provider = override_provider
+        effective_base_url = override_base_url
+        effective_api_key = override_api_key
+    else:
+        effective_provider = override_provider or getattr(parent_agent, "provider", None)
+        effective_base_url = override_base_url or parent_agent.base_url
+        effective_api_key = override_api_key or parent_api_key
+    if not authoritative_route_overrides and not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
-    effective_api_key = override_api_key or parent_api_key
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1799,7 +1844,9 @@ def _build_child_agent(
     # re-derive here before construction.
     _parent_provider = getattr(parent_agent, "provider", None) or ""
     _effective_provider_norm = (effective_provider or "").strip().lower()
-    if override_api_mode is not None:
+    if authoritative_route_overrides:
+        effective_api_mode = override_api_mode
+    elif override_api_mode is not None:
         effective_api_mode = override_api_mode
     elif _effective_provider_norm in {"nous", "nous-portal", "nousresearch"}:
         from hermes_cli.providers import nous_api_mode
@@ -1824,14 +1871,18 @@ def _build_child_agent(
                 f"found on PATH. Install it or remove delegation.command from "
                 f"config.yaml."
             )
-    effective_acp_command = override_acp_command or getattr(
-        parent_agent, "acp_command", None
-    )
-    effective_acp_args = list(
-        override_acp_args
-        if override_acp_args is not None
-        else (getattr(parent_agent, "acp_args", []) or [])
-    )
+    if authoritative_route_overrides:
+        effective_acp_command = override_acp_command
+        effective_acp_args = list(override_acp_args or [])
+    else:
+        effective_acp_command = override_acp_command or getattr(
+            parent_agent, "acp_command", None
+        )
+        effective_acp_args = list(
+            override_acp_args
+            if override_acp_args is not None
+            else (getattr(parent_agent, "acp_args", []) or [])
+        )
 
     # When override_provider is set (e.g. delegation.provider: minimax-cn),
     # the subagent must use direct API calls — not the parent's ACP transport.
@@ -1849,25 +1900,28 @@ def _build_child_agent(
 
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
+    if override_reasoning_config is not _REASONING_OVERRIDE_UNSET:
+        child_reasoning = dict(override_reasoning_config)
+    else:
+        child_reasoning = parent_reasoning
+        try:
+            # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
+            # False (``reasoning_effort: false``) to "" and inherit the parent
+            # instead of disabling thinking for children.
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -3673,10 +3727,17 @@ def delegate_task(
             f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
         )
 
-    # Operator-controlled kill switch — lets the TUI freeze new fan-out
-    # when a runaway tree is detected, without interrupting already-running
-    # children.  Cleared via the matching `delegation.pause` RPC.
-    if is_spawn_paused():
+    # Host-owned spawn gates are shared with the public lifecycle API. Control
+    # operations returned above remain available while new work is paused.
+    from tools.delegation_admission import PAUSED, validate_spawn
+
+    depth = getattr(parent_agent, "_delegate_depth", 0)
+    max_spawn = _get_max_spawn_depth()
+    spawn_rejection = validate_spawn(
+        parent_depth=depth,
+        max_spawn_depth=max_spawn,
+    )
+    if spawn_rejection == PAUSED:
         return tool_error(
             "Delegation spawning is paused. Clear the pause via the TUI "
             "(`p` in /agents) or the `delegation.pause` RPC before retrying."
@@ -3696,9 +3757,7 @@ def delegate_task(
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
-    depth = getattr(parent_agent, "_delegate_depth", 0)
-    max_spawn = _get_max_spawn_depth()
-    if depth >= max_spawn:
+    if spawn_rejection is not None:
         return tool_error(
             f"Delegation depth limit reached (depth={depth}, "
             f"max_spawn_depth={max_spawn}). Raise "
@@ -4297,6 +4356,9 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            enforce_spawn_controls=True,
+            parent_depth=depth,
+            max_spawn_depth=max_spawn,
         )
 
         if dispatch.get("status") == "dispatched":
@@ -4343,7 +4405,23 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
+        if dispatch.get("rejection_code") != "CAPACITY_REACHED":
+            for _child in _child_agents:
+                try:
+                    if hasattr(_child, "close"):
+                        _child.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close unstarted child after admission denial",
+                        exc_info=True,
+                    )
+            return tool_error(
+                "Background delegation was rejected by the host spawn controls "
+                f"({dispatch.get('rejection_code') or 'SCHEDULE_FAILED'}); no "
+                "subagent work was run."
+            )
+
+        # Capacity denial preserves the historical synchronous fallback.
         # (we detach above only on the parent list, but the async unit was
         # never accepted, so re-attaching isn't needed: we just run inline).
         logger.info(
@@ -4425,11 +4503,11 @@ def _resolve_child_credential_pool(
             pool = load_pool(child_key)
             if pool is not None and pool.has_credentials():
                 return pool
-        except Exception as exc:
+        except Exception:
+            # Endpoint identities and pool exceptions can contain credentials,
+            # config paths, environment values, and command arguments.
             logger.debug(
-                "Could not resolve custom credential pool for child endpoint '%s': %s",
-                effective_base_url,
-                exc,
+                "Custom child credential pool resolution was unavailable."
             )
         return None
 
@@ -4442,13 +4520,26 @@ def _resolve_child_credential_pool(
         pool = load_pool(effective_provider)
         if pool is not None and pool.has_credentials():
             return pool
-    except Exception as exc:
-        logger.debug(
-            "Could not load credential pool for child provider '%s': %s",
-            effective_provider,
-            exc,
-        )
+    except Exception:
+        logger.debug("Child credential pool resolution was unavailable.")
     return None
+
+
+def _runtime_route_is_authoritatively_keyless(
+    requested_provider: str, runtime: Dict[str, Any]
+) -> bool:
+    """Accept an empty credential only for a matching native keyless route."""
+    try:
+        from hermes_cli.providers import HERMES_OVERLAYS, normalize_provider
+
+        requested = normalize_provider(requested_provider)
+        resolved = normalize_provider(str(runtime.get("provider") or ""))
+        if not requested or requested != resolved:
+            return False
+        overlay = HERMES_OVERLAYS.get(resolved)
+        return bool(overlay is not None and overlay.keyless)
+    except Exception:
+        return False
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -4560,7 +4651,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         ) from exc
 
     api_key = runtime.get("api_key", "")
-    if not api_key:
+    if not api_key and not _runtime_route_is_authoritatively_keyless(
+        configured_provider, runtime
+    ):
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
             f"Set the appropriate environment variable or run 'hermes auth'."
@@ -4591,6 +4684,186 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }
+
+
+def _bounded_route_identifier(value: Any, *, field: str) -> Optional[str]:
+    """Validate one public provider/model identifier without reflecting it."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string identifier.")
+    normalized = value.strip()
+    if not normalized or len(normalized) > 512 or any(
+        ord(character) < 32 for character in normalized
+    ):
+        raise ValueError(f"{field} must be a bounded non-empty identifier.")
+    return normalized
+
+
+def _resolve_subagent_route(
+    *, provider: Optional[str], model: Optional[str], parent_agent: Any
+) -> Dict[str, Any]:
+    """Resolve a public route through the active profile's native auth path.
+
+    The returned credential bundle is host-private and launch-local. Resolver
+    and catalog diagnostics are deliberately collapsed so keys, URLs, env
+    values, and paths cannot become lifecycle error metadata.
+    """
+    requested_provider = _bounded_route_identifier(provider, field="provider")
+    requested_model = _bounded_route_identifier(model, field="model")
+    if requested_provider is None:
+        requested_provider = _bounded_route_identifier(
+            getattr(parent_agent, "provider", None), field="provider"
+        )
+    if requested_provider is None:
+        raise ValueError("Requested provider/model route is unavailable.")
+    if requested_model is None:
+        requested_model = _bounded_route_identifier(
+            getattr(parent_agent, "model", None), field="model"
+        )
+    if requested_model is None:
+        raise ValueError("Requested provider/model route is unavailable.")
+
+    resolution_failed = False
+    try:
+        resolved = _resolve_delegation_credentials(
+            {"provider": requested_provider, "model": requested_model},
+            parent_agent,
+        )
+        resolved_provider = _bounded_route_identifier(
+            resolved.get("provider"), field="provider"
+        )
+        resolved_model = _bounded_route_identifier(
+            resolved.get("model"), field="model"
+        )
+        if resolved_provider is None or resolved_model is None:
+            raise ValueError("unresolved route")
+
+        from hermes_cli.models import validate_requested_model
+
+        validation = validate_requested_model(
+            resolved_model,
+            resolved_provider,
+            api_key=resolved.get("api_key"),
+            base_url=resolved.get("base_url"),
+            api_mode=resolved.get("api_mode"),
+        )
+        if (
+            not isinstance(validation, dict)
+            or validation.get("accepted") is not True
+            or validation.get("recognized") is not True
+            or validation.get("corrected_model") is not None
+        ):
+            raise ValueError("model unavailable")
+    except Exception:
+        # Do not retain or chain resolver/catalog exceptions: they can contain
+        # profile keys, URLs, paths, environment values, or command arguments.
+        resolution_failed = True
+    if resolution_failed:
+        raise ValueError("Requested provider/model route is unavailable.")
+
+    # Normalize to the exact host-owned fields accepted by the child builder.
+    # No caller-controlled arbitrary mapping or environment reaches this seam.
+    return {
+        "model": resolved_model,
+        "provider": resolved_provider,
+        "base_url": resolved.get("base_url"),
+        "api_key": resolved.get("api_key"),
+        "api_mode": resolved.get("api_mode"),
+        "request_overrides": dict(resolved.get("request_overrides") or {}),
+        "max_output_tokens": resolved.get("max_output_tokens"),
+        "command": resolved.get("command"),
+        "args": list(resolved.get("args") or []),
+    }
+
+
+def _resolved_exact_empty_model_tools() -> tuple[str, ...]:
+    """Resolve exact-empty model definitions without mutating parent state."""
+    import model_tools
+
+    with _CHILD_CONSTRUCTION_LOCK:
+        previous = list(model_tools._last_resolved_tool_names)
+        try:
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=[],
+                disabled_toolsets=[
+                    "terminal",
+                    "file",
+                    "write_file",
+                    "patch",
+                    "delegation",
+                ],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        finally:
+            model_tools._last_resolved_tool_names = previous
+    names = []
+    for definition in definitions:
+        try:
+            names.append(str(definition["function"]["name"]))
+        except Exception:
+            names.append("UNKNOWN_MODEL_TOOL")
+    return tuple(names)
+
+
+def _assess_native_read_only_route(
+    route: Dict[str, Any],
+) -> _NativeReadOnlyTransportReceipt:
+    """Return immutable fail-closed evidence for a v2 exact-empty route."""
+    provider = str(route.get("provider") or "")[:128]
+    model = str(route.get("model") or "")[:128]
+    raw_transport = str(route.get("api_mode") or "").strip().lower()
+    transport = raw_transport if raw_transport in _NATIVE_READ_ONLY_API_MODES else "unknown"
+    channels = set()
+    if provider.strip().lower() == "copilot-acp":
+        channels.add("ACP_FILESYSTEM")
+    if route.get("command") or route.get("args"):
+        channels.add("EXTERNAL_PROCESS")
+    if transport == "unknown":
+        channels.add("UNKNOWN_TRANSPORT")
+    try:
+        model_tool_names = _resolved_exact_empty_model_tools()
+    except Exception:
+        model_tool_names = ("UNKNOWN_MODEL_TOOL",)
+    if model_tool_names:
+        channels.add("HERMES_MODEL_TOOLS")
+    eligible = not channels
+    return _NativeReadOnlyTransportReceipt(
+        provider=provider,
+        model=model,
+        transport=transport,
+        hermes_model_tools_empty=not model_tool_names,
+        independent_mutation_channels=frozenset(channels),
+        eligible=eligible,
+        reason="ELIGIBLE" if eligible else "MUTATION_CHANNEL_UNAVAILABLE",
+    )
+
+
+def _verify_native_read_only_child(
+    child: Any, receipt: _NativeReadOnlyTransportReceipt
+) -> bool:
+    """Verify the instantiated child matches the exact preflight evidence."""
+    if not receipt.eligible:
+        return False
+    actual_provider = str(getattr(child, "provider", "") or "")
+    actual_model = str(getattr(child, "model", "") or "")
+    actual_transport = str(getattr(child, "api_mode", "") or "")
+    actual_command = getattr(child, "acp_command", None)
+    actual_args = getattr(child, "acp_args", None) or []
+    tool_names = getattr(child, "valid_tool_names", None)
+    definitions = getattr(child, "tools", None)
+    return (
+        actual_provider == receipt.provider
+        and actual_model == receipt.model
+        and actual_transport == receipt.transport
+        and not actual_command
+        and not actual_args
+        and tool_names is not None
+        and len(tool_names) == 0
+        and definitions is not None
+        and len(definitions) == 0
+    )
 
 
 def _load_config() -> dict:

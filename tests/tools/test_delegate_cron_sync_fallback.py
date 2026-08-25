@@ -177,3 +177,80 @@ def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
         # Unblock a stray fork thread if the regression reappears, so it
         # cannot outlive this test and pollute the rest of the session.
         release_fork.set()
+
+
+def test_background_capacity_denial_preserves_legacy_synchronous_fallback(monkeypatch):
+    from tools import delegation_admission
+
+    delegation_admission._reset_for_tests()
+    held = delegation_admission.try_acquire_background_unit(1).lease
+    child = _make_real_child()
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "cron_capacity_parent"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    parent._session_db = None
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **_kw: child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
+    monkeypatch.setattr(dt, "_get_max_async_children", lambda: 1)
+    try:
+        with patch("gateway.session_context.async_delivery_supported", return_value=True):
+            out = dt.delegate_task(
+                goal="capacity fallback work",
+                context="shared admission regression",
+                background=True,
+                parent_agent=parent,
+            )
+    finally:
+        held.release()
+
+    payload = json.loads(out)
+    assert payload["results"][0]["status"] == "completed"
+    assert "SYNCHRONOUSLY" in payload["note"]
+
+
+@pytest.mark.parametrize("rejection_code", ["PAUSED", None])
+def test_non_capacity_background_rejection_fails_closed_without_sync_fallback(
+    monkeypatch, rejection_code
+):
+    child = _make_real_child()
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = f"fail_closed_{rejection_code or 'schedule'}"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    parent._session_db = None
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    run_child = MagicMock()
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **_kw: child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    rejection = {"status": "rejected", "error": "host denied"}
+    if rejection_code is not None:
+        rejection["rejection_code"] = rejection_code
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **_kwargs: rejection,
+    )
+
+    with patch("gateway.session_context.async_delivery_supported", return_value=True):
+        output = dt.delegate_task(
+            goal="must fail closed",
+            context="spawn controls",
+            background=True,
+            parent_agent=parent,
+        )
+
+    payload = json.loads(output)
+    assert "no subagent work was run" in payload["error"]
+    run_child.assert_not_called()

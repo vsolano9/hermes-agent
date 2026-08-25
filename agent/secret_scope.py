@@ -26,7 +26,7 @@ import os
 import re
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Dict, Mapping, NamedTuple, Optional
 
 
 # ── multiplex-active flag ────────────────────────────────────────────────
@@ -56,6 +56,14 @@ def is_multiplex_active() -> bool:
 _SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
     "_SECRET_SCOPE", default=None
 )
+_SECRET_SCOPE_AUTHORITATIVE: ContextVar[bool] = ContextVar(
+    "_SECRET_SCOPE_AUTHORITATIVE", default=False
+)
+
+
+class _AuthoritativeSecretScopeToken(NamedTuple):
+    scope: Token
+    authoritative: Token
 
 
 class UnscopedSecretError(RuntimeError):
@@ -80,6 +88,27 @@ def set_secret_scope(secrets: Optional[Mapping[str, str]]) -> Token:
 def reset_secret_scope(token: Token) -> None:
     """Restore the previous secret scope."""
     _SECRET_SCOPE.reset(token)
+
+
+def set_authoritative_secret_scope(
+    secrets: Mapping[str, str],
+) -> _AuthoritativeSecretScopeToken:
+    """Install a context-local profile scope whose misses fail closed.
+
+    Unlike the legacy ``set_secret_scope`` overlay, this mode never falls
+    through to process environment credentials, even when the process-wide
+    multiplex switch is off. It is intended for host-minted per-profile work
+    that must remain isolated without changing global gateway mode.
+    """
+    scope_token = _SECRET_SCOPE.set(secrets)
+    authoritative_token = _SECRET_SCOPE_AUTHORITATIVE.set(True)
+    return _AuthoritativeSecretScopeToken(scope_token, authoritative_token)
+
+
+def reset_authoritative_secret_scope(token: _AuthoritativeSecretScopeToken) -> None:
+    """Restore the context that preceded an authoritative profile scope."""
+    _SECRET_SCOPE_AUTHORITATIVE.reset(token.authoritative)
+    _SECRET_SCOPE.reset(token.scope)
 
 
 def current_secret_scope() -> Optional[Mapping[str, str]]:
@@ -178,7 +207,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = scope.get(name)
         if val is not None:
             return val
-        if _MULTIPLEX_ACTIVE:
+        if _MULTIPLEX_ACTIVE or _SECRET_SCOPE_AUTHORITATIVE.get():
             return default
         # Multiplex off: the scope is an overlay over the process environment,
         # not an isolation boundary — there is no other profile to leak from.

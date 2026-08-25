@@ -17,6 +17,7 @@ Import chain (circular-import safe):
 import ast
 import functools
 import importlib
+import inspect
 import json
 import logging
 import sys
@@ -208,11 +209,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "_execution_scope_factory",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 _execution_scope_factory=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +234,7 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self._execution_scope_factory = _execution_scope_factory
 
 
 class _PluginOverridePolicy:
@@ -775,6 +779,7 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        _execution_scope_factory: Callable = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -870,6 +875,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                _execution_scope_factory=_execution_scope_factory,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1145,11 +1151,28 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            scope_factory = entry._execution_scope_factory
+            if scope_factory is None:
+                result = entry.handler(args, **kwargs)
+            else:
+                execution_scope = scope_factory()
+                with execution_scope:
+                    result = entry.handler(args, **kwargs)
+                if inspect.isawaitable(result):
+                    pending = result
+
+                    async def _await_in_execution_scope():
+                        # Re-enter the dispatch scope so opted-in plugin tools
+                        # retain one audit operation ID while each synchronous
+                        # or awaited phase still receives a separately
+                        # revocable ContextVar authority lease.
+                        with execution_scope:
+                            return await pending
+
+                    result = _await_in_execution_scope()
             if entry.is_async:
                 from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
+                result = _run_async(result)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.

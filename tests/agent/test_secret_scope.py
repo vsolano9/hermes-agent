@@ -80,6 +80,26 @@ class TestScopedSingleProfile:
         finally:
             ss.reset_secret_scope(token)
 
+    def test_authoritative_scope_miss_never_falls_through_to_environ(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MISSING_PROFILE_KEY", "process-poison-canary")
+        token = ss.set_authoritative_secret_scope({"PROFILE_KEY": "profile-value"})
+        try:
+            assert ss.get_secret("PROFILE_KEY") == "profile-value"
+            assert ss.get_secret("MISSING_PROFILE_KEY") is None
+            assert ss.get_secret("MISSING_PROFILE_KEY", "safe-default") == "safe-default"
+        finally:
+            ss.reset_authoritative_secret_scope(token)
+
+        # Existing callers retain overlay semantics after the authoritative
+        # binding is gone.
+        token = ss.set_secret_scope({})
+        try:
+            assert ss.get_secret("MISSING_PROFILE_KEY") == "process-poison-canary"
+        finally:
+            ss.reset_secret_scope(token)
+
     def test_multiplex_on_still_authoritative(self, monkeypatch):
         # The fallthrough is strictly multiplex-off behavior: turning
         # multiplexing on must restore scope-authoritative semantics.

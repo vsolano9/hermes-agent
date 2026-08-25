@@ -846,6 +846,54 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIn("no API key", str(ctx.exception))
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_catalog_declared_keyless_provider_accepts_empty_key_without_fallback(
+        self, mock_resolve
+    ):
+        mock_resolve.return_value = {
+            "provider": "opencode-free",
+            "model": "x-preview-f-free",
+            "base_url": "https://opencode.ai/zen/v1",
+            "api_key": "",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.api_key = "parent-key-poison"
+        cfg = {"model": "x-preview-f-free", "provider": "opencode-free"}
+
+        with patch.dict(
+            os.environ,
+            {"OPENCODE_ZEN_API_KEY": "environment-key-poison"},
+            clear=False,
+        ):
+            creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["provider"], "opencode-free")
+        self.assertEqual(creds["model"], "x-preview-f-free")
+        self.assertEqual(creds["api_key"], "")
+        self.assertNotEqual(creds["api_key"], parent.api_key)
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_unknown_provider_cannot_borrow_keyless_runtime_identity(
+        self, mock_resolve
+    ):
+        mock_resolve.return_value = {
+            "provider": "opencode-free",
+            "model": "x-preview-f-free",
+            "base_url": "https://opencode.ai/zen/v1",
+            "api_key": "",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_delegation_credentials(
+                {"model": "x-preview-f-free", "provider": "unknown-provider"},
+                parent,
+            )
+
+        self.assertIn("no API key", str(ctx.exception))
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_named_custom_provider_preserves_provider_name(self, mock_resolve):
         """Named custom provider (e.g. crof.ai) resolves to 'custom' at runtime level
         but the subagent must retain the original provider identity so that

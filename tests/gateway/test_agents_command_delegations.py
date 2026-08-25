@@ -44,7 +44,7 @@ class _Event:
     source = None
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_agents_command_marks_stalling_delegation(monkeypatch):
     monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
     monkeypatch.setattr(ad, "_STALE_IDLE_SECONDS", 0.1)
@@ -57,6 +57,7 @@ async def test_agents_command_marks_stalling_delegation(monkeypatch):
         model="m", session_key="agent:main:test:dm:1", max_async_children=1,
         runner=lambda: {} if gate.wait(timeout=10) else {},
         progress_fn=lambda: ((0, None), False),
+        enforce_spawn_controls=False,
     )
     assert res["status"] == "dispatched"
 
@@ -82,5 +83,3 @@ async def test_agents_command_marks_stalling_delegation(monkeypatch):
     assert res["delegation_id"] in out
     assert "stalling" in out
     assert "no progress" in out
-
-

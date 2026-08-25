@@ -68,6 +68,7 @@ class TestBackgroundDispatch:
 
         with _bound_session_key():
             with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
+                 patch("tools.delegate_tool._get_max_async_children", return_value=1), \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run_one_job), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
@@ -121,6 +122,43 @@ class TestBackgroundDispatch:
         assert found["status"] == "completed"
         assert "bg run" in (found.get("summary") or "")
         assert "Next scheduled run" in found["summary"]
+
+    def test_manual_cron_dispatch_is_explicitly_spawn_pause_exempt(self):
+        """Cron host work shares capacity without weakening subagent pause."""
+        import time
+
+        from tools import async_delegation as async_registry
+        from tools import delegation_admission
+
+        release = threading.Event()
+
+        def run_job(_job_value, **_kwargs):
+            assert release.wait(timeout=60)
+            return True
+
+        delegation_admission.set_spawn_paused(True)
+        try:
+            with _bound_session_key():
+                with patch(
+                    "tools.cronjob_tools.claim_job_for_fire",
+                    side_effect=lambda jid, **kw: {
+                        **_job(jid), "fire_claim": {"by": "bg-owner"}
+                    },
+                ), patch("cron.scheduler.run_one_job", side_effect=run_job), patch(
+                    "tools.cronjob_tools.get_job",
+                    return_value={"last_status": "ok", "last_error": None},
+                ):
+                    result = _try_dispatch_background_run(
+                        _job("job-bg-pause-exempt")
+                    )
+            assert result["dispatched"] is True
+            assert delegation_admission.is_spawn_paused() is True
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while async_registry.active_count() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            delegation_admission.set_spawn_paused(False)
 
     def test_failed_run_reports_error_status_in_event(self):
         import time
@@ -193,6 +231,26 @@ class TestSyncFallbacks:
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
+
+    def test_real_shared_capacity_denial_runs_inline_with_same_receipt(self):
+        """Direct cron callers cannot bypass the shared dispatcher lease."""
+        from tools import delegation_admission
+
+        delegation_admission._reset_for_tests()
+        held = delegation_admission.try_acquire_background_unit(1).lease
+        try:
+            with _bound_session_key():
+                with patch("tools.delegate_tool._get_max_async_children", return_value=1), \
+                     patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+                     patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+                     patch("tools.cronjob_tools.get_job", return_value={"last_status": "ok", "last_error": None}):
+                    res = _try_dispatch_background_run(_job("job-bg-shared-cap"))
+        finally:
+            held.release()
+
+        assert res["dispatched"] is False
+        assert res["success"] is True
+        m_run.assert_called_once()
 
 
 class TestInFlightDedupe:

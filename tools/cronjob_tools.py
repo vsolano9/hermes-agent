@@ -1179,6 +1179,9 @@ def _try_dispatch_background_run(
         origin_ui_session_id=origin_ui_session_id,
         origin_session_id=origin_session_id,
         max_async_children=max_async,
+        # A manual cron run is host work, not a subagent-tree spawn. It shares
+        # capacity but is intentionally exempt from spawn pause/depth.
+        enforce_spawn_controls=False,
     )
 
     if dispatch.get("status") == "dispatched":

@@ -534,6 +534,41 @@ def register(ctx):
 
 The dispatched tool goes through the normal approval, redaction, and budget pipelines — it's a real tool invocation, not a shortcut around them.
 
+### Supervise asynchronous subagents
+
+Plugins that need an owned asynchronous child should use the public
+[`PluginContext` subagent lifecycle](../subagent-lifecycle-api.md), not import
+`delegate_task` internals. Opt in by declaring an unambiguous keyword-only
+`invocation` parameter:
+
+```python
+from agent.subagent_lifecycle import SubagentLaunchRequest, SubagentLaunchRequestV2
+
+def inspect(args, *, invocation):
+    handle = invocation.subagents.launch(SubagentLaunchRequestV2(
+        api_contract_version=2,
+        base=SubagentLaunchRequest(goal=args["goal"]),
+        toolset_mode="exact",
+        exact_toolsets=(),
+    ))
+    return handle.to_dict()
+```
+
+The host binds the facade to the plugin, canonical profile, manager, and
+session for the complete synchronous or awaited handler lifetime. A retained
+handle can be listed, steered, stopped, and collected in a later turn of that
+same session. The per-turn `invocation.operation_id` changes for audit purposes;
+it is not authority. Legacy handlers that do not opt in receive their exact
+historical arguments and cannot inherit lifecycle authority from a nested
+opted-in dispatch.
+
+Use v2 exact-empty only when the task truly needs zero Hermes model tools.
+Hermes also checks the effective transport before treating such a child as a
+native read-only route; zero tool definitions alone are not proof of
+read-only behavior. Working-directory overrides are currently unsupported.
+Provider credentials and transport commands remain host-private. Native
+in-flight handles are process-local and become unknown after restart.
+
 ### Store settings and runtime state
 
 Use plugin-relative config keys for user-visible behavior. Hermes resolves them

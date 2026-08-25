@@ -1611,8 +1611,24 @@ class PluginContext:
                 SubagentLifecycleService,
                 get_active_subagent_parent,
             )
-            self._subagent_lifecycle = SubagentLifecycleService(
-                get_active_subagent_parent
+            from hermes_cli.plugin_invocation import (
+                _mint_bound_subagent_lifecycle,
+                _revoke_bound_subagent_lifecycle,
+            )
+
+            service = SubagentLifecycleService(get_active_subagent_parent)
+            facade = _mint_bound_subagent_lifecycle(
+                service,
+                plugin_id=self.plugin_id,
+                profile_path=self._manager.home_path,
+                manager_scope_key=self._manager.scope_key,
+                parent_resolver=get_active_subagent_parent,
+            )
+            self._subagent_lifecycle = facade
+            self._track(
+                "subagent_lifecycle",
+                self.plugin_id,
+                lambda: _revoke_bound_subagent_lifecycle(facade),
             )
         return self._subagent_lifecycle
 
@@ -1729,6 +1745,8 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        *,
+        inject_invocation: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -1744,6 +1762,11 @@ class PluginContext:
         any enabled plugin could silently replace a privileged built-in
         like ``shell_exec`` or ``write_file`` and exfiltrate everything
         the model invokes through it.
+
+        Invocation context is additive and explicit: a keyword-only
+        ``invocation`` parameter opts in automatically, while a handler with
+        ``**kwargs`` or a positional-or-keyword ``invocation`` must pass the
+        keyword-only registration flag ``inject_invocation=True``.
         """
         if override and not self._tool_override_allowed(name):
             plugin_id = self.manifest.key or self.manifest.name
@@ -1755,6 +1778,117 @@ class PluginContext:
             )
 
         from tools.registry import registry
+
+        registered_handler = handler
+
+        def _legacy_tool_execution_scope():
+            from hermes_cli.plugin_invocation import (
+                _suppress_bound_subagent_authority,
+            )
+
+            return _suppress_bound_subagent_authority()
+
+        # Every plugin call gets an explicit authority boundary. Legacy tools
+        # suppress any outer opted-in authority without creating a facade.
+        execution_scope_factory = _legacy_tool_execution_scope
+        try:
+            parameters = inspect.signature(handler).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        parameter_items = list(parameters.items())
+        invocation_parameter = parameters.get("invocation")
+        auto_inject = bool(
+            invocation_parameter is not None
+            and invocation_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        )
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if inject_invocation and invocation_parameter is None and not accepts_kwargs:
+            raise TypeError(
+                "inject_invocation=True requires a handler that accepts the "
+                "invocation keyword."
+            )
+        if inject_invocation and invocation_parameter is not None:
+            if invocation_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                raise TypeError("Plugin tool handler must accept invocation as a keyword.")
+            if invocation_parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                invocation_index = next(
+                    index
+                    for index, (parameter_name, _parameter) in enumerate(parameter_items)
+                    if parameter_name == "invocation"
+                )
+                has_payload_before = any(
+                    parameter.kind in {
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    }
+                    for _name, parameter in parameter_items[:invocation_index]
+                )
+                if not has_payload_before:
+                    raise TypeError(
+                        "A positional invocation parameter must follow the tool payload."
+                    )
+        should_inject = auto_inject or inject_invocation
+        if should_inject:
+            original_handler = handler
+            invocation_lifecycle = self.subagent_lifecycle
+
+            def _tool_execution_scope():
+                from hermes_cli.plugin_invocation import (
+                    _bind_bound_subagent_authority,
+                )
+
+                return _bind_bound_subagent_authority(invocation_lifecycle)
+
+            execution_scope_factory = _tool_execution_scope
+            accepted_metadata = {
+                parameter_name
+                for parameter_name, parameter in parameter_items
+                if parameter_name != "invocation"
+                and parameter.kind in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+            }
+            first_positional = next((
+                parameter_name
+                for parameter_name, parameter in parameter_items
+                if parameter.kind in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }
+            ), None)
+            if first_positional is not None:
+                accepted_metadata.discard(first_positional)
+
+            @wraps(original_handler)
+            def _invocation_handler(args: dict, **kwargs):
+                from hermes_cli.plugin_invocation import _make_plugin_tool_invocation
+
+                with _plugin_home_scope(self._manager.home_path):
+                    profile_name = self.profile_name
+                invocation = _make_plugin_tool_invocation(
+                    profile_name=profile_name,
+                    session_id=kwargs.get("session_id"),
+                    task_id=kwargs.get("task_id"),
+                    subagents=invocation_lifecycle,
+                )
+                forwarded_kwargs = (
+                    kwargs
+                    if accepts_kwargs
+                    else {
+                        key: value
+                        for key, value in kwargs.items()
+                        if key in accepted_metadata
+                    }
+                )
+                return original_handler(
+                    args, invocation=invocation, **forwarded_kwargs
+                )
+
+            registered_handler = _invocation_handler
 
         scope = self._manager.scope_key
         previous = registry.snapshot_registration(name, scope=scope)
@@ -1770,7 +1904,7 @@ class PluginContext:
             name=name,
             toolset=toolset,
             schema=schema,
-            handler=handler,
+            handler=registered_handler,
             check_fn=check_fn,
             requires_env=requires_env,
             is_async=is_async,
@@ -1778,12 +1912,13 @@ class PluginContext:
             emoji=emoji,
             override=override,
             scope=scope,
+            _execution_scope_factory=execution_scope_factory,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         if (
             registered is not None
             and registered is not previous
-            and registered.handler is handler
+            and registered.handler is registered_handler
         ):
             self._manager._plugin_tool_names.add(name)
             def _restore_tool(replacement: Any) -> bool:
@@ -6756,7 +6891,7 @@ def get_plugin_toolsets() -> List[tuple]:
     toolset_tools: Dict[str, List[str]] = {}
     toolset_plugin: Dict[str, LoadedPlugin] = {}
     for tool_name in manager._plugin_tool_names:
-        entry = registry.get_entry(tool_name)
+        entry = registry.get_entry(tool_name, scope=manager.scope_key)
         if not entry:
             continue
         ts = entry.toolset
@@ -6765,7 +6900,7 @@ def get_plugin_toolsets() -> List[tuple]:
     # Map toolsets back to the plugin that registered them
     for _name, loaded in manager._plugins.items():
         for tool_name in loaded.tools_registered:
-            entry = registry.get_entry(tool_name)
+            entry = registry.get_entry(tool_name, scope=manager.scope_key)
             if entry and entry.toolset in toolset_tools:
                 toolset_plugin.setdefault(entry.toolset, loaded)
 
