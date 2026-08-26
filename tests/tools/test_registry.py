@@ -6,6 +6,10 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+from agent.delegation_context import delegated_child_context
+from agent.subagent_lifecycle import bind_subagent_parent
 from tools.registry import (
     ToolRegistry,
     _MAX_LOGGED_ERROR_CHARS,
@@ -39,6 +43,65 @@ class TestRegisterAndDispatch:
         )
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
+
+    def test_root_execution_scope_enforces_visibility_and_dispatch(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="root_only",
+            toolset="root-scope",
+            schema=_make_schema("root_only"),
+            handler=_dummy_handler,
+            execution_scope="root",
+        )
+
+        assert [
+            item["function"]["name"]
+            for item in reg.get_definitions({"root_only"})
+        ] == ["root_only"]
+        with delegated_child_context("child-session"):
+            assert reg.get_definitions({"root_only"}) == []
+
+        assert "root execution context" in json.loads(
+            reg.dispatch("root_only", {})
+        )["error"].lower()
+        with bind_subagent_parent(
+            type("Parent", (), {"_delegate_depth": 0, "session_id": "root"})()
+        ):
+            assert json.loads(reg.dispatch("root_only", {})) == {"ok": True}
+        with bind_subagent_parent(
+            type("Child", (), {"_delegate_depth": 1, "session_id": "child"})()
+        ):
+            assert "root execution context" in json.loads(
+                reg.dispatch("root_only", {})
+            )["error"].lower()
+        for index, raw_depth in enumerate((None, [], -1, True)):
+            unknown = type(
+                f"Unknown{index}",
+                (),
+                {"_delegate_depth": raw_depth, "session_id": f"unknown-{index}"},
+            )()
+            with bind_subagent_parent(unknown):
+                assert reg.get_definitions({"root_only"}) == []
+                assert "root execution context" in json.loads(
+                    reg.dispatch("root_only", {})
+                )["error"].lower()
+        missing = type("MissingDepth", (), {"session_id": "missing"})()
+        with bind_subagent_parent(missing):
+            assert reg.get_definitions({"root_only"}) == []
+            assert "root execution context" in json.loads(
+                reg.dispatch("root_only", {})
+            )["error"].lower()
+
+    def test_register_rejects_unknown_execution_scope(self):
+        reg = ToolRegistry()
+        with pytest.raises(ValueError, match="execution_scope"):
+            reg.register(
+                name="bad_scope",
+                toolset="root-scope",
+                schema=_make_schema("bad_scope"),
+                handler=_dummy_handler,
+                execution_scope="nested",
+            )
 
 
     def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):

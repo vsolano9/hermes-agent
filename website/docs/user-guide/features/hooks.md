@@ -414,7 +414,11 @@ The contract is deliberately narrow:
   rendered after memory/profile context and before session metadata; plugins
   cannot reorder or replace core prompt content.
 - A callable receives a read-only mapping with `session_id`, `model`,
-  `provider`, `platform`, `profile_name`, and `cwd`. It runs **once for a new
+  `provider`, `platform`, `profile_name`, `cwd`, `execution_kind`,
+  `delegation_depth`, and `delegation_role`. These execution fields are
+  host-derived rather than environment-derived. Only exact integer depth `0`
+  is root; missing or malformed host depth is exposed as unknown with depth
+  `-1` and cannot unlock root-scoped content. It runs **once for a new
   session**. Its rendered bytes are frozen on compression and recovered from
   the already-persisted full system prompt after a process restart/resume;
   plugin state is not re-read for an existing session.
@@ -424,6 +428,9 @@ The contract is deliberately narrow:
   sections are skipped with a warning; prompt construction continues.
 - Every accepted section is named in the prompt and logged at session start
   with its plugin, position, and character count.
+- `execution_scope="root"` excludes a section from delegated-child prompts,
+  including the constructor-time window before child metadata is finalized,
+  and from any prompt whose host depth identity is missing or malformed.
 
 Use `pre_llm_call` for truly dynamic per-turn context. There is intentionally
 no plugin environment-hints hook in this contract: changing cwd, branch, or

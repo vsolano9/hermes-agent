@@ -5,6 +5,8 @@ from types import MappingProxyType
 
 import pytest
 
+from agent.delegation_context import delegated_child_context
+from agent.system_prompt import _plugin_session_info
 from hermes_cli.plugins import (
     MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS,
     PluginContext,
@@ -88,3 +90,95 @@ def test_render_fails_open_for_callback_failure_wrong_type_and_aggregate_budget(
     assert "plugin exploded" in caplog.text
     assert "returned dict, not str" in caplog.text
     assert "aggregate" in caplog.text
+
+
+def test_root_scoped_prompt_section_is_absent_from_delegated_session():
+    manager = PluginManager()
+    ctx = _context(manager)
+    ctx.register_system_prompt_section(
+        "example.root-only", "ROOT-CANARY", execution_scope="root"
+    )
+    ctx.register_system_prompt_section("example.all", "ALL-CONTEXT")
+
+    root = manager.render_system_prompt_sections({"delegation_depth": 0})
+    delegated = manager.render_system_prompt_sections({"delegation_depth": 1})
+    missing = manager.render_system_prompt_sections({})
+
+    assert [section.id for section in root] == ["example.all", "example.root-only"]
+    assert [section.id for section in delegated] == ["example.all"]
+    assert [section.id for section in missing] == ["example.all"]
+
+
+def test_prompt_registration_rejects_unknown_execution_scope():
+    manager = PluginManager()
+    with pytest.raises(ValueError, match="execution_scope"):
+        _context(manager).register_system_prompt_section(
+            "example.bad-scope", "content", execution_scope="nested"
+        )
+
+
+def test_constructor_time_child_context_cannot_render_root_prompt_section():
+    agent = type("AgentUnderConstruction", (), {"session_id": "child"})()
+
+    unbound_info = _plugin_session_info(agent)
+    assert unbound_info["execution_kind"] == "unknown"
+    assert unbound_info["delegation_depth"] == -1
+    assert unbound_info["delegation_role"] == "unknown"
+    with delegated_child_context("child"):
+        info = _plugin_session_info(agent)
+
+    assert info["execution_kind"] == "delegated"
+    assert info["delegation_depth"] == 1
+    assert info["delegation_role"] == "leaf"
+
+
+def test_child_prompt_identity_rejects_unstructured_host_role():
+    agent = type(
+        "MalformedRoleAgent",
+        (),
+        {"session_id": "child", "_delegate_depth": 1, "_delegate_role": ["leaf"]},
+    )()
+
+    info = _plugin_session_info(agent)
+
+    assert info["execution_kind"] == "delegated"
+    assert info["delegation_role"] == "leaf"
+
+
+@pytest.mark.parametrize("raw_depth", [None, [], -1, True])
+def test_malformed_prompt_depth_is_unknown_and_cannot_render_root_section(raw_depth):
+    manager = PluginManager()
+    _context(manager).register_system_prompt_section(
+        "example.root-only", "ROOT-CANARY", execution_scope="root"
+    )
+    agent = type(
+        "MalformedDepthAgent",
+        (),
+        {"session_id": "unknown", "_delegate_depth": raw_depth},
+    )()
+
+    info = _plugin_session_info(agent)
+
+    assert info["execution_kind"] == "unknown"
+    assert info["delegation_depth"] == -1
+    assert info["delegation_role"] == "unknown"
+    assert manager.render_system_prompt_sections(info) == []
+
+
+@pytest.mark.parametrize("raw_depth", [65, 10**100])
+def test_positive_prompt_depth_remains_delegated(raw_depth):
+    agent = type(
+        "DeepDelegatedAgent",
+        (),
+        {
+            "session_id": "deep-child",
+            "_delegate_depth": raw_depth,
+            "_delegate_role": "orchestrator",
+        },
+    )()
+
+    info = _plugin_session_info(agent)
+
+    assert info["execution_kind"] == "delegated"
+    assert info["delegation_depth"] == raw_depth
+    assert info["delegation_role"] == "orchestrator"

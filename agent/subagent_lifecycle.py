@@ -24,7 +24,8 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 from agent.interrupt_compat import request_hard_interrupt
 
 PUBLIC_CONTRACT_VERSION = 1
-LIFECYCLE_API_CONTRACT_VERSION = 2
+LIFECYCLE_API_CONTRACT_VERSION = 3
+_SUPPORTED_LAUNCH_REQUEST_API_CONTRACT_VERSIONS = frozenset({2, 3})
 _MAX_GOAL_CHARS = 16_000
 _MAX_CONTEXT_CHARS = 32_000
 _MAX_METADATA_BYTES = 8_192
@@ -33,6 +34,37 @@ _MAX_API_CALLS = 1_000_000
 _MAX_DURATION_SECONDS = 31_536_000.0
 _TERMINAL_RETENTION_SECONDS = 3_600
 _AUDIT_UNSET = object()
+_MAX_ROUTE_IDENTIFIER_CHARS = 200
+_MAX_ROUTE_CANDIDATES = 512
+_MAX_PUBLIC_TIMESTAMP_SECONDS = 253_402_300_799.0
+_ROUTE_REASONS = frozenset(
+    {
+        "COMPLETE",
+        "CATALOG_UNAVAILABLE",
+        "CATALOG_INCOMPLETE",
+        "ELIGIBLE",
+        "MUTATION_CHANNEL_UNAVAILABLE",
+        "ROUTE_UNAVAILABLE",
+    }
+)
+_ROUTE_MUTATION_CHANNELS = frozenset(
+    {
+        "ACP_FILESYSTEM",
+        "EXTERNAL_PROCESS",
+        "UNKNOWN_TRANSPORT",
+        "HERMES_MODEL_TOOLS",
+    }
+)
+_ROUTE_TRANSPORTS = frozenset(
+    {
+        "chat_completions",
+        "codex_responses",
+        "anthropic_messages",
+        "bedrock_converse",
+        "unknown",
+        "unavailable",
+    }
+)
 
 
 class _FrozenMapping(Mapping[str, Any]):
@@ -153,6 +185,251 @@ def _bounded_duration_seconds(value: Any) -> float:
 
 class SubagentLifecycleError(ValueError):
     """A request cannot be safely accepted by the public lifecycle API."""
+
+
+def _public_route_identifier(value: Any, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise SubagentLifecycleError(f"{field} must be a string identifier.")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > _MAX_ROUTE_IDENTIFIER_CHARS
+        or not normalized[0].isalnum()
+        or not normalized[0].isascii()
+        or "://" in normalized
+        or any(
+            not character.isascii()
+            or not (character.isalnum() or character in {"-", "_", ".", ":", "/", "@", "+"})
+            for character in normalized
+        )
+    ):
+        raise SubagentLifecycleError(
+            f"{field} must be a bounded public identifier."
+        )
+    return normalized
+
+
+def _public_route_receipt_id(value: Any, *, prefix: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != len(prefix) + 32
+        or not value.startswith(prefix)
+        or any(character not in "0123456789abcdef" for character in value[len(prefix) :])
+    ):
+        raise SubagentLifecycleError("Malformed public route receipt identity.")
+    return value
+
+
+def _public_route_assessed_at(value: Any) -> float:
+    if type(value) is not float or not math.isfinite(value) or not 0 < value <= _MAX_PUBLIC_TIMESTAMP_SECONDS:
+        raise SubagentLifecycleError("Malformed public route assessment timestamp.")
+    return value
+
+
+def _new_public_route_receipt_metadata(*, prefix: str) -> tuple[float, str]:
+    assessed_at = float(time.time())
+    if not math.isfinite(assessed_at) or assessed_at <= 0:
+        assessed_at = 0.000001
+    else:
+        assessed_at = min(assessed_at, _MAX_PUBLIC_TIMESTAMP_SECONDS)
+    return assessed_at, f"{prefix}{secrets.token_hex(16)}"
+
+
+@dataclasses.dataclass(frozen=True)
+class SubagentRouteIdentity:
+    provider: str
+    model: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "provider", _public_route_identifier(self.provider, field="provider")
+        )
+        object.__setattr__(
+            self, "model", _public_route_identifier(self.model, field="model")
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class SubagentRouteAssessment:
+    api_contract_version: int
+    route: SubagentRouteIdentity
+    eligible: bool
+    reason: str
+    transport: str
+    authenticated: bool
+    agent_capable: bool
+    exact_empty_model_tools: bool
+    mutation_evidence_complete: bool
+    independent_mutation_channels: frozenset[str]
+    hermes_model_tool_count: int
+    assessed_at: float
+    assessment_id: str
+
+    def __post_init__(self) -> None:
+        if self.api_contract_version != LIFECYCLE_API_CONTRACT_VERSION:
+            raise SubagentLifecycleError("Unsupported lifecycle API contract version.")
+        if not isinstance(self.route, SubagentRouteIdentity):
+            raise SubagentLifecycleError("Malformed subagent route identity.")
+        if (
+            type(self.eligible) is not bool
+            or self.reason not in _ROUTE_REASONS
+            or self.transport not in _ROUTE_TRANSPORTS
+            or any(
+                type(flag) is not bool
+                for flag in (
+                    self.authenticated,
+                    self.agent_capable,
+                    self.exact_empty_model_tools,
+                    self.mutation_evidence_complete,
+                )
+            )
+        ):
+            raise SubagentLifecycleError("Malformed subagent route assessment.")
+        channels = frozenset(self.independent_mutation_channels)
+        if not channels <= _ROUTE_MUTATION_CHANNELS:
+            raise SubagentLifecycleError("Malformed subagent route assessment.")
+        if (
+            type(self.hermes_model_tool_count) is not int
+            or not 0 <= self.hermes_model_tool_count <= _MAX_ROUTE_CANDIDATES
+        ):
+            raise SubagentLifecycleError("Malformed subagent route assessment.")
+        _public_route_assessed_at(self.assessed_at)
+        _public_route_receipt_id(self.assessment_id, prefix="asm_")
+        unknown_transport = self.transport == "unknown"
+        unknown_transport_channel = "UNKNOWN_TRANSPORT" in channels
+        model_tools_channel = "HERMES_MODEL_TOOLS" in channels
+        if unknown_transport != unknown_transport_channel:
+            raise SubagentLifecycleError("Malformed subagent route assessment.")
+        if self.mutation_evidence_complete:
+            if (
+                self.exact_empty_model_tools
+                != (self.hermes_model_tool_count == 0)
+                or model_tools_channel != (self.hermes_model_tool_count > 0)
+            ):
+                raise SubagentLifecycleError("Malformed subagent route assessment.")
+        elif (
+            self.exact_empty_model_tools
+            or self.hermes_model_tool_count != 0
+            or model_tools_channel
+        ):
+            raise SubagentLifecycleError("Malformed subagent route assessment.")
+        if self.eligible:
+            if (
+                self.reason != "ELIGIBLE"
+                or self.transport in {"unknown", "unavailable"}
+                or not self.authenticated
+                or not self.agent_capable
+                or not self.exact_empty_model_tools
+                or not self.mutation_evidence_complete
+                or channels
+                or self.hermes_model_tool_count != 0
+            ):
+                raise SubagentLifecycleError("Malformed subagent route assessment.")
+        elif self.reason == "ROUTE_UNAVAILABLE":
+            if (
+                self.transport != "unavailable"
+                or self.authenticated
+                or self.agent_capable
+                or self.exact_empty_model_tools
+                or self.mutation_evidence_complete
+                or channels
+                or self.hermes_model_tool_count != 0
+            ):
+                raise SubagentLifecycleError("Malformed subagent route assessment.")
+        elif self.reason == "MUTATION_CHANNEL_UNAVAILABLE":
+            if (
+                self.transport == "unavailable"
+                or not self.authenticated
+                or not self.agent_capable
+                or not (channels or not self.mutation_evidence_complete)
+            ):
+                raise SubagentLifecycleError("Malformed subagent route assessment.")
+        else:
+            raise SubagentLifecycleError("Malformed subagent route assessment.")
+        object.__setattr__(self, "independent_mutation_channels", channels)
+
+
+@dataclasses.dataclass(frozen=True)
+class SubagentRouteCatalog:
+    api_contract_version: int
+    complete: bool
+    routes: tuple[SubagentRouteIdentity, ...]
+    candidate_count: int
+    reason: str
+    assessed_at: float
+    snapshot_id: str
+
+    def __post_init__(self) -> None:
+        routes = tuple(self.routes)
+        if self.api_contract_version != LIFECYCLE_API_CONTRACT_VERSION:
+            raise SubagentLifecycleError("Unsupported lifecycle API contract version.")
+        if type(self.complete) is not bool or self.reason not in _ROUTE_REASONS:
+            raise SubagentLifecycleError("Malformed subagent route catalog.")
+        _public_route_assessed_at(self.assessed_at)
+        _public_route_receipt_id(self.snapshot_id, prefix="snap_")
+        if (
+            any(not isinstance(route, SubagentRouteIdentity) for route in routes)
+            or len(routes) > _MAX_ROUTE_CANDIDATES
+            or type(self.candidate_count) is not int
+            or not 0 <= self.candidate_count <= _MAX_ROUTE_CANDIDATES
+        ):
+            raise SubagentLifecycleError("Malformed subagent route catalog.")
+        if self.complete:
+            if self.reason != "COMPLETE" or self.candidate_count != len(routes):
+                raise SubagentLifecycleError("Malformed subagent route catalog.")
+        elif routes or self.reason not in {"CATALOG_UNAVAILABLE", "CATALOG_INCOMPLETE"}:
+            raise SubagentLifecycleError("Malformed subagent route catalog.")
+        object.__setattr__(self, "routes", routes)
+
+
+def _new_route_catalog(
+    *,
+    complete: bool,
+    routes: tuple[SubagentRouteIdentity, ...],
+    candidate_count: int,
+    reason: str,
+) -> SubagentRouteCatalog:
+    assessed_at, snapshot_id = _new_public_route_receipt_metadata(prefix="snap_")
+    return SubagentRouteCatalog(
+        api_contract_version=LIFECYCLE_API_CONTRACT_VERSION,
+        complete=complete,
+        routes=routes,
+        candidate_count=candidate_count,
+        reason=reason,
+        assessed_at=assessed_at,
+        snapshot_id=snapshot_id,
+    )
+
+
+def _new_route_assessment(
+    *,
+    route: SubagentRouteIdentity,
+    eligible: bool,
+    reason: str,
+    transport: str,
+    authenticated: bool,
+    agent_capable: bool,
+    exact_empty_model_tools: bool,
+    mutation_evidence_complete: bool,
+    independent_mutation_channels: frozenset[str],
+    hermes_model_tool_count: int,
+) -> SubagentRouteAssessment:
+    assessed_at, assessment_id = _new_public_route_receipt_metadata(prefix="asm_")
+    return SubagentRouteAssessment(
+        api_contract_version=LIFECYCLE_API_CONTRACT_VERSION,
+        route=route,
+        eligible=eligible,
+        reason=reason,
+        transport=transport,
+        authenticated=authenticated,
+        agent_capable=agent_capable,
+        exact_empty_model_tools=exact_empty_model_tools,
+        mutation_evidence_complete=mutation_evidence_complete,
+        independent_mutation_channels=independent_mutation_channels,
+        hermes_model_tool_count=hermes_model_tool_count,
+        assessed_at=assessed_at,
+        assessment_id=assessment_id,
+    )
 
 
 class SubagentState(str, enum.Enum):
@@ -443,11 +720,121 @@ class SubagentLifecycleService:
                     "provider_routing",
                     "reasoning_override",
                     "native_read_only_transport_gate",
+                    "route_catalog",
+                    "route_assessment",
+                    "root_execution_context",
                 }
             ),
             providers_are_host_resolved=True,
             working_directory_supported=False,
             restart_recovery="unsupported",
+        )
+
+    def catalog_routes(self) -> SubagentRouteCatalog:
+        """Return a complete bounded snapshot of authenticated native routes.
+
+        Discovery is read-only and never constructs a child or consumes
+        admission. Any unsafe, malformed, or oversized inventory collapses to
+        a fixed incomplete receipt rather than exposing a partial catalog.
+        """
+        parent = self._parent_agent_resolver()
+        if parent is None:
+            return _new_route_catalog(
+                complete=False,
+                routes=(),
+                candidate_count=0,
+                reason="CATALOG_UNAVAILABLE",
+            )
+        try:
+            from tools.delegate_tool import _catalog_subagent_routes
+
+            discovered = _catalog_subagent_routes(parent)
+            routes = tuple(
+                SubagentRouteIdentity(provider, model)
+                for provider, model in discovered
+            )
+        except OverflowError:
+            return _new_route_catalog(
+                complete=False,
+                routes=(),
+                candidate_count=0,
+                reason="CATALOG_INCOMPLETE",
+            )
+        except Exception:
+            return _new_route_catalog(
+                complete=False,
+                routes=(),
+                candidate_count=0,
+                reason="CATALOG_UNAVAILABLE",
+            )
+        return _new_route_catalog(
+            complete=True,
+            routes=routes,
+            candidate_count=len(routes),
+            reason="COMPLETE",
+        )
+
+    def assess_route(self, provider: str, model: str) -> SubagentRouteAssessment:
+        """Resolve and assess one exact-empty route without launching work."""
+        requested = SubagentRouteIdentity(provider, model)
+        parent = self._parent_agent_resolver()
+        if parent is None:
+            return _new_route_assessment(
+                route=requested,
+                eligible=False,
+                reason="ROUTE_UNAVAILABLE",
+                transport="unavailable",
+                authenticated=False,
+                agent_capable=False,
+                exact_empty_model_tools=False,
+                mutation_evidence_complete=False,
+                independent_mutation_channels=frozenset(),
+                hermes_model_tool_count=0,
+            )
+        try:
+            from tools.delegate_tool import (
+                _assess_native_read_only_route,
+                _resolve_subagent_route,
+            )
+
+            resolved = _resolve_subagent_route(
+                provider=requested.provider,
+                model=requested.model,
+                parent_agent=parent,
+            )
+            receipt = _assess_native_read_only_route(resolved)
+            route = SubagentRouteIdentity(receipt.provider, receipt.model)
+            channels = frozenset(receipt.independent_mutation_channels)
+            tool_count = receipt.hermes_model_tool_count
+            reason = receipt.reason
+            eligible = bool(receipt.eligible)
+            transport = receipt.transport
+            exact_empty_model_tools = receipt.hermes_model_tools_empty
+            mutation_evidence_complete = receipt.mutation_evidence_complete
+        except Exception:
+            return _new_route_assessment(
+                route=requested,
+                eligible=False,
+                reason="ROUTE_UNAVAILABLE",
+                transport="unavailable",
+                authenticated=False,
+                agent_capable=False,
+                exact_empty_model_tools=False,
+                mutation_evidence_complete=False,
+                independent_mutation_channels=frozenset(),
+                hermes_model_tool_count=0,
+            )
+        return _new_route_assessment(
+            route=route,
+            eligible=eligible,
+            reason=reason,
+            transport=transport,
+            authenticated=True,
+            agent_capable=True,
+            exact_empty_model_tools=exact_empty_model_tools,
+            mutation_evidence_complete=mutation_evidence_complete,
+            independent_mutation_channels=channels,
+            hermes_model_tool_count=tool_count,
         )
 
     def _record_audit_metadata(
@@ -1247,7 +1634,8 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError("Unsupported lifecycle launch request.")
         if (
             type(request.api_contract_version) is not int
-            or request.api_contract_version != LIFECYCLE_API_CONTRACT_VERSION
+            or request.api_contract_version
+            not in _SUPPORTED_LAUNCH_REQUEST_API_CONTRACT_VERSIONS
         ):
             raise SubagentLifecycleError("Unsupported lifecycle API contract version.")
         if not isinstance(request.base, SubagentLaunchRequest):

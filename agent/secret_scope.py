@@ -116,6 +116,11 @@ def current_secret_scope() -> Optional[Mapping[str, str]]:
     return _SECRET_SCOPE.get()
 
 
+def is_authoritative_secret_scope() -> bool:
+    """Return whether the active mapping is a fail-closed profile authority."""
+    return _SECRET_SCOPE.get() is not None and _SECRET_SCOPE_AUTHORITATIVE.get()
+
+
 # ── genuinely-global env vars (NOT per-profile secrets) ──────────────────
 # These are process/deployment-level settings, not profile credentials. They
 # legitimately live in os.environ and must keep reading from it even in

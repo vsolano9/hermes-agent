@@ -209,13 +209,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
-        "_execution_scope_factory",
+        "execution_scope", "_execution_scope_factory",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
-                 _execution_scope_factory=None):
+                 execution_scope="all", _execution_scope_factory=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -234,7 +234,54 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.execution_scope = execution_scope
         self._execution_scope_factory = _execution_scope_factory
+
+
+def root_execution_context_for_definitions() -> bool:
+    """Whether model/prompt assembly belongs to a root Hermes execution."""
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        if is_delegated_child_context():
+            return False
+    except Exception:
+        return False
+    try:
+        from agent.subagent_lifecycle import get_active_subagent_parent
+
+        parent = get_active_subagent_parent()
+    except Exception:
+        parent = None
+    if parent is None:
+        # Agent construction occurs before turn-local parent binding. The
+        # delegated-child ContextVar above is the authoritative construction
+        # marker; an unmarked construction is a root definition context.
+        return True
+    from agent.delegation_context import classify_delegation_depth
+
+    execution_kind, _depth = classify_delegation_depth(
+        getattr(parent, "_delegate_depth", None)
+    )
+    return execution_kind == "root"
+
+
+def active_root_execution_context() -> bool:
+    """Whether a dispatch is currently owned by a bound root Hermes agent."""
+    try:
+        from agent.subagent_lifecycle import get_active_subagent_parent
+
+        parent = get_active_subagent_parent()
+    except Exception:
+        return False
+    if parent is None:
+        return False
+    from agent.delegation_context import classify_delegation_depth
+
+    execution_kind, _depth = classify_delegation_depth(
+        getattr(parent, "_delegate_depth", None)
+    )
+    return execution_kind == "root"
 
 
 class _PluginOverridePolicy:
@@ -779,6 +826,7 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        execution_scope: str = "all",
         _execution_scope_factory: Callable = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -789,6 +837,8 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        if execution_scope not in {"all", "root"}:
+            raise ValueError("execution_scope must be 'all' or 'root'")
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner
@@ -875,6 +925,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                execution_scope=execution_scope,
                 _execution_scope_factory=_execution_scope_factory,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
@@ -1068,6 +1119,11 @@ class ToolRegistry:
             entry = entries_by_name.get(name)
             if not entry:
                 continue
+            if (
+                entry.execution_scope == "root"
+                and not root_execution_context_for_definitions()
+            ):
+                continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
                     check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
@@ -1150,6 +1206,10 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        if entry.execution_scope == "root" and not active_root_execution_context():
+            return tool_error(
+                f"Tool {name} is available only in a root execution context."
+            )
         try:
             scope_factory = entry._execution_scope_factory
             if scope_factory is None:

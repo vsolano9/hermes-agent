@@ -509,3 +509,60 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+def test_root_scoped_tool_definition_cache_does_not_leak_into_delegated_child():
+    import model_tools
+    from agent.delegation_context import delegated_child_context
+    from agent.subagent_lifecycle import bind_subagent_parent
+    from tools.registry import registry
+
+    name = "_root_definition_cache_probe"
+    registry.register(
+        name=name,
+        toolset="_root_definition_cache",
+        schema={
+            "name": name,
+            "description": "root definition cache probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: "ok",
+        execution_scope="root",
+    )
+    try:
+        model_tools._clear_tool_defs_cache()
+        root_names = {
+            item["function"]["name"]
+            for item in model_tools.get_tool_definitions(
+                enabled_toolsets=["_root_definition_cache"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        }
+        with delegated_child_context("child-session"):
+            child_names = {
+                    item["function"]["name"]
+                    for item in model_tools.get_tool_definitions(
+                        enabled_toolsets=["_root_definition_cache"],
+                        quiet_mode=True,
+                        skip_tool_search_assembly=True,
+                    )
+            }
+        missing_depth_parent = type(
+            "MissingDepthParent", (), {"session_id": "unknown-session"}
+        )()
+        with bind_subagent_parent(missing_depth_parent):
+            unknown_names = {
+                item["function"]["name"]
+                for item in model_tools.get_tool_definitions(
+                    enabled_toolsets=["_root_definition_cache"],
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
+            }
+        assert name in root_names
+        assert name not in child_names
+        assert name not in unknown_names
+    finally:
+        registry.deregister(name)
+        model_tools._clear_tool_defs_cache()

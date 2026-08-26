@@ -1120,6 +1120,7 @@ class PluginSystemPromptSection:
     position: str
     max_chars: int
     plugin: str
+    execution_scope: str = "all"
 
 
 @dataclass(frozen=True)
@@ -1747,6 +1748,7 @@ class PluginContext:
         override: bool = False,
         *,
         inject_invocation: bool = False,
+        execution_scope: str = "all",
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -1768,6 +1770,8 @@ class PluginContext:
         ``**kwargs`` or a positional-or-keyword ``invocation`` must pass the
         keyword-only registration flag ``inject_invocation=True``.
         """
+        if execution_scope not in {"all", "root"}:
+            raise ValueError("execution_scope must be 'all' or 'root'")
         if override and not self._tool_override_allowed(name):
             plugin_id = self.manifest.key or self.manifest.name
             raise PluginToolOverrideError(
@@ -1912,6 +1916,7 @@ class PluginContext:
             emoji=emoji,
             override=override,
             scope=scope,
+            execution_scope=execution_scope,
             _execution_scope_factory=execution_scope_factory,
         )
         registered = registry.snapshot_registration(name, scope=scope)
@@ -3359,6 +3364,7 @@ class PluginContext:
         *,
         position: str = "after_memory",
         max_chars: int = DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS,
+        execution_scope: str = "all",
     ) -> PluginRegistration:
         """Register bounded context that is frozen into each new session prompt.
 
@@ -3373,6 +3379,8 @@ class PluginContext:
             )
         if not isinstance(content, str) and not callable(content):
             raise TypeError("system prompt section content must be a string or callable")
+        if execution_scope not in {"all", "root"}:
+            raise ValueError("execution_scope must be 'all' or 'root'")
         if position not in SYSTEM_PROMPT_SECTION_POSITIONS:
             raise ValueError(
                 "system prompt section position must be one of: "
@@ -3400,6 +3408,7 @@ class PluginContext:
             position=position,
             max_chars=max_chars,
             plugin=plugin_id,
+            execution_scope=execution_scope,
         )
         self._manager._system_prompt_sections[id] = section
         # Record ownership so unload/force-reload removes this section.
@@ -5666,11 +5675,19 @@ class PluginManager:
         self, session_info: Mapping[str, Any]
     ) -> List[RenderedPluginSystemPromptSection]:
         """Render all registered sections deterministically and fail open."""
+        from agent.delegation_context import classify_delegation_depth
+
         frozen_info = types.MappingProxyType(dict(session_info))
         rendered: List[RenderedPluginSystemPromptSection] = []
         total_chars = len(PLUGIN_SECTIONS_START) + len(PLUGIN_SECTIONS_END) + 2
         for section_id in sorted(self._system_prompt_sections):
             section = self._system_prompt_sections[section_id]
+            execution_kind, _depth = classify_delegation_depth(
+                session_info.get("delegation_depth")
+            )
+            is_root = execution_kind == "root"
+            if section.execution_scope == "root" and not is_root:
+                continue
             if len(rendered) >= MAX_SYSTEM_PROMPT_SECTIONS:
                 logger.warning(
                     "Plugin system prompt section %s exceeded the section-count "

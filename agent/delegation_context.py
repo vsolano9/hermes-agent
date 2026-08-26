@@ -44,6 +44,24 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_DB",
 )
 
+UNKNOWN_DELEGATION_DEPTH = -1
+
+
+def classify_delegation_depth(raw_depth: object) -> tuple[str, int]:
+    """Classify host-owned depth without ever inferring root authority.
+
+    Only the exact integer ``0`` is root. Every exact positive integer remains
+    delegated, matching the core's deliberately unbounded depth contract.
+    Absent, boolean, malformed, and negative values are unknown and receive a
+    non-root sentinel depth.
+    """
+    if type(raw_depth) is int:
+        if raw_depth == 0:
+            return "root", 0
+        if raw_depth > 0:
+            return "delegated", raw_depth
+    return "unknown", UNKNOWN_DELEGATION_DEPTH
+
 
 @contextmanager
 def delegated_child_context(session_id: str | None = None) -> Iterator[None]:

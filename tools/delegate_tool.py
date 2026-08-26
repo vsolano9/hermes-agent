@@ -51,6 +51,7 @@ _REASONING_OVERRIDE_UNSET = object()
 _NATIVE_READ_ONLY_API_MODES = frozenset(
     {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
 )
+_MAX_PUBLIC_ROUTE_IDENTIFIER_CHARS = 200
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -61,6 +62,8 @@ class _NativeReadOnlyTransportReceipt:
     model: str
     transport: str
     hermes_model_tools_empty: bool
+    hermes_model_tool_count: int
+    mutation_evidence_complete: bool
     independent_mutation_channels: frozenset[str]
     eligible: bool
     reason: str
@@ -4650,6 +4653,12 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
         ) from exc
 
+    resolved_provider = str(runtime.get("provider") or configured_provider).strip().lower()
+    if not _resolved_route_auth_is_proven(resolved_provider, runtime):
+        raise ValueError(
+            f"Delegation provider '{resolved_provider}' has no attributable credentials."
+        )
+
     api_key = runtime.get("api_key", "")
     if not api_key and not _runtime_route_is_authoritatively_keyless(
         configured_provider, runtime
@@ -4693,11 +4702,65 @@ def _bounded_route_identifier(value: Any, *, field: str) -> Optional[str]:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string identifier.")
     normalized = value.strip()
-    if not normalized or len(normalized) > 512 or any(
-        ord(character) < 32 for character in normalized
+    if (
+        not normalized
+        or len(normalized) > _MAX_PUBLIC_ROUTE_IDENTIFIER_CHARS
+        or not normalized[0].isalnum()
+        or not normalized[0].isascii()
+        or "://" in normalized
+        or any(
+            not character.isascii()
+            or not (
+                character.isalnum()
+                or character in {"-", "_", ".", ":", "/", "@", "+"}
+            )
+            for character in normalized
+        )
     ):
-        raise ValueError(f"{field} must be a bounded non-empty identifier.")
+        raise ValueError(f"{field} must be a bounded public identifier.")
     return normalized
+
+
+def _resolved_route_auth_is_proven(
+    provider: str, runtime: Dict[str, Any]
+) -> bool:
+    """Apply the catalog's offline profile-auth classifier to one route."""
+    from agent.secret_scope import is_authoritative_secret_scope
+
+    if not is_authoritative_secret_scope():
+        if provider == "bedrock":
+            from agent.bedrock_adapter import has_aws_credentials
+
+            return bool(has_aws_credentials())
+        # Outside a bound profile, retain the existing runtime resolver's
+        # authority for API-key, keyless, external-process, and Vertex routes.
+        # The offline classifier is required only when a profile authority has
+        # been explicitly minted; Bedrock's SDK sentinel has always required
+        # its additional concrete credential check here.
+        return True
+
+    try:
+        from hermes_cli.provider_catalog import provider_catalog_by_slug
+
+        descriptor = provider_catalog_by_slug().get(provider)
+        if descriptor is None:
+            return bool(runtime.get("api_key")) and runtime.get("api_key") != "aws-sdk"
+        auth_snapshot = _read_profile_auth_snapshot_for_catalog()
+        profile_config = _read_profile_config_snapshot_for_catalog()
+        evidence = _profile_provider_auth_evidence(
+            provider,
+            auth_type=str(getattr(descriptor, "auth_type", "") or "").strip().lower(),
+            env_names=getattr(descriptor, "api_key_env_vars", ()),
+            keyless=bool(getattr(descriptor, "keyless", False)),
+            provider_states=auth_snapshot["providers"],
+            credential_pool=auth_snapshot["credential_pool"],
+            profile_config=profile_config,
+            required=True,
+            resolved_runtime=runtime,
+        )
+        return evidence == "authenticated"
+    except Exception:
+        return False
 
 
 def _resolve_subagent_route(
@@ -4777,6 +4840,433 @@ def _resolve_subagent_route(
     }
 
 
+def _read_bounded_profile_file(path: Any, *, label: str) -> Optional[bytes]:
+    """Read one exact regular profile file without following its final link."""
+    import stat
+    try:
+        file_stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+        raise OverflowError(f"profile {label} inventory is incomplete")
+    if file_stat.st_size > 2 * 1024 * 1024:
+        raise OverflowError(f"profile {label} inventory is incomplete")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        opened_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or opened_stat.st_dev != file_stat.st_dev
+            or opened_stat.st_ino != file_stat.st_ino
+            or opened_stat.st_size > 2 * 1024 * 1024
+        ):
+            raise OverflowError(f"profile {label} inventory is incomplete")
+        chunks = []
+        remaining = 2 * 1024 * 1024 + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > 2 * 1024 * 1024:
+            raise OverflowError(f"profile {label} inventory is incomplete")
+    finally:
+        os.close(fd)
+    return payload
+
+
+def _read_profile_auth_snapshot_for_catalog() -> dict[str, Any]:
+    """Read only the active profile's bounded auth store, without fallback.
+
+    This deliberately does not call ``_load_auth_store``: that legacy reader
+    can preserve corrupt files and its adjacent helpers merge global-profile
+    credentials. Catalog discovery must neither write nor borrow authority.
+    """
+    from hermes_constants import get_hermes_home
+
+    payload = _read_bounded_profile_file(
+        get_hermes_home() / "auth.json", label="auth"
+    )
+    if payload is None:
+        return {"providers": {}, "credential_pool": {}}
+    try:
+        raw = json.loads(payload.decode("utf-8-sig"))
+    except Exception:
+        raise OverflowError("profile auth inventory is incomplete") from None
+    if not isinstance(raw, dict):
+        raise OverflowError("profile auth inventory is incomplete")
+    providers = raw.get("providers", {})
+    pool = raw.get("credential_pool", {})
+    if not isinstance(providers, dict) or not isinstance(pool, dict):
+        raise OverflowError("profile auth inventory is incomplete")
+    if any(not isinstance(state, dict) for state in providers.values()):
+        raise OverflowError("profile auth inventory is incomplete")
+    if any(
+        not isinstance(entries, list)
+        or any(not isinstance(entry, dict) for entry in entries)
+        for entries in pool.values()
+    ):
+        raise OverflowError("profile auth inventory is incomplete")
+    return {"providers": providers, "credential_pool": pool}
+
+
+def _read_profile_config_snapshot_for_catalog() -> dict[str, Any]:
+    """Parse exact profile config with no ensure/default/migration/cache path."""
+    from hermes_constants import get_hermes_home
+    from utils import fast_safe_load
+
+    payload = _read_bounded_profile_file(
+        get_hermes_home() / "config.yaml", label="config"
+    )
+    if payload is None:
+        return {}
+    try:
+        raw = fast_safe_load(payload.decode("utf-8-sig")) or {}
+    except Exception:
+        raise OverflowError("profile config inventory is incomplete") from None
+    if not isinstance(raw, dict):
+        raise OverflowError("profile config inventory is incomplete")
+    return raw
+
+
+def _catalog_expiry_is_fresh(value: Any) -> bool:
+    """Return true only for a bounded, explicitly future expiry receipt."""
+    from datetime import datetime, timezone
+
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        expires_at = float(value)
+        if expires_at > 10_000_000_000:
+            expires_at /= 1000.0
+    elif isinstance(value, str) and 0 < len(value) <= 80:
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except (TypeError, ValueError):
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        expires_at = parsed.timestamp()
+    else:
+        return False
+    return 0 < expires_at <= 253_402_300_799.0 and expires_at > time.time() + 30
+
+
+def _profile_auth_evidence(
+    provider: str,
+    *,
+    auth_type: str,
+    provider_states: dict[str, Any],
+    credential_pool: dict[str, Any],
+) -> str:
+    """Classify local persisted evidence as absent, authenticated, or stale."""
+    from hermes_cli.auth import has_usable_secret
+
+    state = provider_states.get(provider)
+    entries = credential_pool.get(provider)
+    evidence_present = state is not None or entries is not None
+    candidates: list[dict[str, Any]] = []
+    if state is not None:
+        if not isinstance(state, dict):
+            return "unprovable"
+        candidates.append(state)
+    if entries is not None:
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, dict) for entry in entries
+        ):
+            return "unprovable"
+        candidates.extend(entries)
+
+    oauth_provider = auth_type.startswith("oauth")
+    allowed_sources = {
+        "device_code",
+        "loopback_pkce",
+        "hermes_pkce",
+        "manual",
+        "manual:device_code",
+    }
+    reference_candidates = 0
+    for candidate in candidates:
+        source = str(candidate.get("source") or "").strip().lower()
+        if source.startswith(("env:", "config:")):
+            embedded_secret = any(
+                has_usable_secret(candidate.get(field))
+                for field in ("access_token", "api_key", "agent_key", "token")
+            )
+            if (
+                not embedded_secret
+                and has_usable_secret(candidate.get("secret_fingerprint"))
+            ):
+                # Credential-pool entries intentionally persist only a
+                # fingerprint and source reference. They are well-formed
+                # metadata, not independent auth evidence; the matching
+                # authoritative scope must still provide the actual secret.
+                reference_candidates += 1
+                continue
+        if source and source not in allowed_sources and not source.startswith("manual:"):
+            continue
+        if str(candidate.get("last_status") or "").strip().lower() == "dead":
+            continue
+        secret = next(
+            (
+                candidate.get(field)
+                for field in ("access_token", "api_key", "agent_key", "token")
+                if has_usable_secret(candidate.get(field))
+            ),
+            None,
+        )
+        if secret is None:
+            continue
+        candidate_oauth = oauth_provider or str(
+            candidate.get("auth_type") or ""
+        ).strip().lower().startswith("oauth")
+        if candidate_oauth:
+            expiry = next(
+                (
+                    candidate.get(field)
+                    for field in ("expires_at", "expiresAt", "expires_at_ms")
+                    if candidate.get(field) is not None
+                ),
+                None,
+            )
+            if not _catalog_expiry_is_fresh(expiry):
+                continue
+        return "authenticated"
+    if candidates and reference_candidates == len(candidates):
+        return "reference"
+    return "unprovable" if evidence_present else "absent"
+
+
+def _profile_provider_auth_evidence(
+    provider: str,
+    *,
+    auth_type: str,
+    env_names: Any,
+    keyless: bool,
+    provider_states: dict[str, Any],
+    credential_pool: dict[str, Any],
+    profile_config: dict[str, Any],
+    required: bool,
+    resolved_runtime: Optional[dict[str, Any]] = None,
+) -> str:
+    """Classify one provider from profile-owned, offline evidence only."""
+    from agent.secret_scope import current_secret_scope
+    from hermes_cli.auth import has_usable_secret
+
+    if not isinstance(env_names, tuple) or any(
+        not isinstance(name, str) or not name for name in env_names
+    ):
+        return "unprovable"
+    scope = current_secret_scope() or {}
+    persisted = _profile_auth_evidence(
+        provider,
+        auth_type=auth_type,
+        provider_states=provider_states,
+        credential_pool=credential_pool,
+    )
+    provider_config_present = provider in profile_config
+    provider_config = profile_config.get(provider)
+    if persisted == "unprovable" or (
+        provider_config_present and not isinstance(provider_config, dict)
+    ):
+        return "unprovable"
+    if keyless:
+        return "authenticated"
+
+    configured = isinstance(provider_config, dict) and bool(provider_config)
+    if auth_type == "aws_sdk":
+        # The Bedrock worker and its region-keyed client cache still consume
+        # boto/default-process credentials. Until launch accepts a retained,
+        # profile-private AWS bundle, even explicit scoped credentials cannot
+        # safely prove that the eventual worker will use this authority.
+        scoped_signal = any(
+            has_usable_secret(scope.get(name))
+            for name in (
+                "AWS_BEARER_TOKEN_BEDROCK",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_PROFILE",
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+            )
+        )
+        return (
+            "unprovable"
+            if configured or scoped_signal or persisted != "absent" or required
+            else "absent"
+        )
+
+    if auth_type == "vertex":
+        opaque_signal = configured or any(
+            has_usable_secret(scope.get(name))
+            for name in (
+                "VERTEX_CREDENTIALS_PATH",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "VERTEX_PROJECT_ID",
+            )
+        )
+        return "unprovable" if opaque_signal or persisted != "absent" or required else "absent"
+
+    if auth_type in {"external_process", "copilot"}:
+        # A concrete command is the native resolver's host-owned capability
+        # receipt for an assessed external-process route. Catalog discovery
+        # never invokes that resolver and therefore cannot make this claim.
+        command = (
+            resolved_runtime.get("command")
+            if isinstance(resolved_runtime, dict)
+            else None
+        )
+        if isinstance(command, str) and command.strip():
+            return "authenticated"
+        return "unprovable" if configured or persisted != "absent" or required else "absent"
+
+    scoped_auth = any(has_usable_secret(scope.get(name)) for name in env_names)
+    if scoped_auth or persisted == "authenticated":
+        return "authenticated"
+    if persisted in {"unprovable", "reference"}:
+        return "unprovable"
+    if auth_type == "api_key" or auth_type.startswith("oauth"):
+        return "absent"
+    return "unprovable" if configured or required else "absent"
+
+
+def _catalog_subagent_routes(parent_agent: Any) -> tuple[tuple[str, str], ...]:
+    """Return an offline, profile-authoritative native route inventory.
+
+    The catalog consumes only the already-minted authoritative secret mapping,
+    the active profile's local config/auth store, and in-repo model snapshots.
+    It never calls the interactive picker, provider probes, credential-pool
+    loaders, external CLIs/stores, or mutable model caches. Any stale or
+    unprovable credential/catalog evidence fails the whole snapshot closed.
+    """
+    from agent.secret_scope import (
+        current_secret_scope,
+        is_authoritative_secret_scope,
+    )
+    from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS
+    from hermes_cli.provider_catalog import provider_catalog
+
+    if not is_authoritative_secret_scope():
+        raise ValueError("authoritative profile scope is unavailable")
+    secrets_by_name = current_secret_scope()
+    if secrets_by_name is None:
+        raise ValueError("authoritative profile scope is unavailable")
+
+    profile_config = _read_profile_config_snapshot_for_catalog()
+    user_providers = profile_config.get("providers", {})
+    custom_providers = profile_config.get("custom_providers", [])
+    if not isinstance(user_providers, dict) or not isinstance(custom_providers, list):
+        raise OverflowError("configured route inventory is incomplete")
+    if user_providers or custom_providers:
+        raise OverflowError("configured route inventory is incomplete")
+    model_catalog = profile_config.get("model_catalog", {})
+    if not isinstance(model_catalog, dict):
+        raise OverflowError("configured route inventory is incomplete")
+    raw_excluded = model_catalog.get("excluded_providers", [])
+    if not isinstance(raw_excluded, list):
+        raise OverflowError("configured route inventory is incomplete")
+    excluded: set[str] = set()
+    for raw_provider in raw_excluded:
+        if not isinstance(raw_provider, str):
+            raise OverflowError("configured route inventory is incomplete")
+        try:
+            excluded_provider = _bounded_route_identifier(
+                raw_provider, field="excluded provider"
+            )
+        except ValueError:
+            raise OverflowError("configured route inventory is incomplete") from None
+        if excluded_provider is None:
+            raise OverflowError("configured route inventory is incomplete")
+        excluded.add(excluded_provider.lower())
+    auth_snapshot = _read_profile_auth_snapshot_for_catalog()
+    provider_states = auth_snapshot["providers"]
+    credential_pool = auth_snapshot["credential_pool"]
+    raw_parent_provider = getattr(parent_agent, "provider", None)
+    parent_provider = (
+        _bounded_route_identifier(raw_parent_provider, field="provider")
+        if raw_parent_provider
+        else None
+    )
+
+    routes: set[tuple[str, str]] = set()
+    descriptors = provider_catalog()
+    if not isinstance(descriptors, list):
+        raise ValueError("profile route inventory is unavailable")
+    seen_providers: set[str] = set()
+    for descriptor in descriptors:
+        raw_provider = getattr(descriptor, "slug", None)
+        if (
+            isinstance(raw_provider, str)
+            and len(raw_provider.strip()) > _MAX_PUBLIC_ROUTE_IDENTIFIER_CHARS
+        ):
+            raise OverflowError("profile route inventory is incomplete")
+        provider = _bounded_route_identifier(
+            raw_provider, field="provider"
+        )
+        if provider is None or provider in seen_providers:
+            raise ValueError("profile route inventory is unavailable")
+        seen_providers.add(provider)
+        if provider == "moa" or provider.lower() in excluded:
+            continue
+
+        auth_type = str(getattr(descriptor, "auth_type", "") or "").strip().lower()
+        env_names = getattr(descriptor, "api_key_env_vars", ())
+        evidence = _profile_provider_auth_evidence(
+            provider,
+            auth_type=auth_type,
+            env_names=env_names,
+            keyless=bool(getattr(descriptor, "keyless", False)),
+            provider_states=provider_states,
+            credential_pool=credential_pool,
+            profile_config=profile_config,
+            required=provider == parent_provider,
+        )
+        if evidence == "unprovable":
+            raise OverflowError("profile auth inventory is incomplete")
+        if evidence != "authenticated":
+            continue
+
+        if provider == "openrouter":
+            raw_models: Any = [item[0] for item in OPENROUTER_MODELS]
+        else:
+            raw_models = _PROVIDER_MODELS.get(provider)
+        if not isinstance(raw_models, list) or not raw_models:
+            raise OverflowError("profile model inventory is incomplete")
+        for raw_model in raw_models:
+            if (
+                isinstance(raw_model, str)
+                and len(raw_model.strip()) > _MAX_PUBLIC_ROUTE_IDENTIFIER_CHARS
+            ):
+                raise OverflowError("profile model inventory is incomplete")
+            model = _bounded_route_identifier(raw_model, field="model")
+            if model is None:
+                raise ValueError("profile route inventory is unavailable")
+            routes.add((provider, model))
+            if len(routes) > 512:
+                raise OverflowError("profile route inventory exceeds public bound")
+
+    if parent_provider is not None:
+        parent_model = _bounded_route_identifier(
+            getattr(parent_agent, "model", None), field="model"
+        )
+        if (
+            parent_provider is not None
+            and parent_provider != "moa"
+            and parent_provider.lower() not in excluded
+            and (parent_model is None or (parent_provider, parent_model) not in routes)
+        ):
+            raise OverflowError("active profile route inventory is incomplete")
+    return tuple(sorted(routes))
+
+
 def _resolved_exact_empty_model_tools() -> tuple[str, ...]:
     """Resolve exact-empty model definitions without mutating parent state."""
     import model_tools
@@ -4811,8 +5301,10 @@ def _assess_native_read_only_route(
     route: Dict[str, Any],
 ) -> _NativeReadOnlyTransportReceipt:
     """Return immutable fail-closed evidence for a v2 exact-empty route."""
-    provider = str(route.get("provider") or "")[:128]
-    model = str(route.get("model") or "")[:128]
+    provider = _bounded_route_identifier(route.get("provider"), field="provider")
+    model = _bounded_route_identifier(route.get("model"), field="model")
+    if provider is None or model is None:
+        raise ValueError("malformed route identity")
     raw_transport = str(route.get("api_mode") or "").strip().lower()
     transport = raw_transport if raw_transport in _NATIVE_READ_ONLY_API_MODES else "unknown"
     channels = set()
@@ -4822,18 +5314,23 @@ def _assess_native_read_only_route(
         channels.add("EXTERNAL_PROCESS")
     if transport == "unknown":
         channels.add("UNKNOWN_TRANSPORT")
+    mutation_evidence_complete = True
     try:
         model_tool_names = _resolved_exact_empty_model_tools()
     except Exception:
-        model_tool_names = ("UNKNOWN_MODEL_TOOL",)
-    if model_tool_names:
+        model_tool_names = ()
+        mutation_evidence_complete = False
+    if mutation_evidence_complete and model_tool_names:
         channels.add("HERMES_MODEL_TOOLS")
-    eligible = not channels
+    exact_empty_model_tools = mutation_evidence_complete and not model_tool_names
+    eligible = exact_empty_model_tools and not channels
     return _NativeReadOnlyTransportReceipt(
         provider=provider,
         model=model,
         transport=transport,
-        hermes_model_tools_empty=not model_tool_names,
+        hermes_model_tools_empty=exact_empty_model_tools,
+        hermes_model_tool_count=min(len(model_tool_names), 512),
+        mutation_evidence_complete=mutation_evidence_complete,
         independent_mutation_channels=frozenset(channels),
         eligible=eligible,
         reason="ELIGIBLE" if eligible else "MUTATION_CHANNEL_UNAVAILABLE",

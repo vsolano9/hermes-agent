@@ -159,7 +159,7 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
-def _plugin_session_info(agent: Any) -> Dict[str, str]:
+def _plugin_session_info(agent: Any) -> Dict[str, Any]:
     """Return immutable-at-render-time metadata exposed to prompt sections."""
     try:
         cwd = str(resolve_context_cwd() or "")
@@ -178,6 +178,32 @@ def _plugin_session_info(agent: Any) -> Dict[str, str]:
             profile_name = str(get_active_profile_name() or "default")
     except Exception:
         profile_name = "default"
+    from agent.delegation_context import (
+        classify_delegation_depth,
+        is_delegated_child_context,
+    )
+
+    execution_kind, delegation_depth = classify_delegation_depth(
+        getattr(agent, "_delegate_depth", None)
+    )
+    try:
+        if execution_kind != "delegated" and is_delegated_child_context():
+            # Child construction enters this host-owned context before the
+            # fully-built agent receives its durable depth metadata. Keep
+            # root-only prompt sections out of that constructor-time window.
+            execution_kind = "delegated"
+            delegation_depth = 1
+    except Exception:
+        pass
+    raw_role = getattr(agent, "_delegate_role", None)
+    if execution_kind == "delegated":
+        delegation_role = (
+            raw_role
+            if isinstance(raw_role, str) and raw_role in {"leaf", "orchestrator"}
+            else "leaf"
+        )
+    else:
+        delegation_role = "root" if execution_kind == "root" else "unknown"
     return {
         "session_id": str(getattr(agent, "session_id", None) or ""),
         "model": str(getattr(agent, "model", None) or ""),
@@ -185,6 +211,9 @@ def _plugin_session_info(agent: Any) -> Dict[str, str]:
         "platform": str(getattr(agent, "platform", None) or ""),
         "profile_name": profile_name,
         "cwd": cwd,
+        "execution_kind": execution_kind,
+        "delegation_depth": delegation_depth,
+        "delegation_role": delegation_role,
     }
 
 

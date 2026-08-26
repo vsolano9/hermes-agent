@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import os
 import dataclasses
+import json
 import logging
+import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
 
+import agent.subagent_lifecycle as lifecycle_contracts
 from agent.secret_scope import reset_secret_scope, set_secret_scope
+from agent.secret_scope import (
+    reset_authoritative_secret_scope,
+    set_authoritative_secret_scope,
+)
 from agent.subagent_lifecycle import (
     SubagentLaunchRequest,
     SubagentLaunchRequestV2,
@@ -20,6 +28,7 @@ from agent.subagent_lifecycle import (
     bind_subagent_parent,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from tools import delegate_tool
 from tools import delegation_admission
 from tools.registry import registry
 
@@ -124,6 +133,838 @@ def _routed_request(*, mode="exact", toolsets=(), reasoning="high", workdir=None
         provider="synthetic",
         reasoning_effort=reasoning,
     )
+
+
+def test_route_catalog_and_assessment_are_bounded_immutable_and_launch_free(
+    monkeypatch,
+):
+    parent = _parent()
+    service = SubagentLifecycleService(lambda: parent)
+    monkeypatch.setattr(
+        "tools.delegate_tool._catalog_subagent_routes",
+        lambda _parent: (
+            ("synthetic", "model-a"),
+            ("synthetic", "model-b"),
+        ),
+    )
+    _install_route(monkeypatch)
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools",
+        lambda **_kwargs: pytest.fail("catalog/assessment must not build a child"),
+    )
+
+    catalog = service.catalog_routes()
+    assert isinstance(catalog, lifecycle_contracts.SubagentRouteCatalog)
+    assert catalog.complete is True
+    assert catalog.candidate_count == 2
+    assert isinstance(catalog.assessed_at, float)
+    assert catalog.assessed_at > 0
+    assert re.fullmatch(r"snap_[0-9a-f]{32}", catalog.snapshot_id)
+    assert catalog.routes == (
+        lifecycle_contracts.SubagentRouteIdentity("synthetic", "model-a"),
+        lifecycle_contracts.SubagentRouteIdentity("synthetic", "model-b"),
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        catalog.complete = False
+
+    assessment = service.assess_route("synthetic", "model-a")
+    assert isinstance(assessment, lifecycle_contracts.SubagentRouteAssessment)
+    assert assessment.route == lifecycle_contracts.SubagentRouteIdentity(
+        "synthetic", "model-a"
+    )
+    assert assessment.eligible is True
+    assert assessment.reason == "ELIGIBLE"
+    assert assessment.transport == "chat_completions"
+    assert assessment.authenticated is True
+    assert assessment.agent_capable is True
+    assert assessment.exact_empty_model_tools is True
+    assert assessment.mutation_evidence_complete is True
+    assert assessment.independent_mutation_channels == frozenset()
+    assert assessment.hermes_model_tool_count == 0
+    assert isinstance(assessment.assessed_at, float)
+    assert assessment.assessed_at > 0
+    assert re.fullmatch(r"asm_[0-9a-f]{32}", assessment.assessment_id)
+    assert "secret" not in repr(assessment).lower()
+
+
+def test_route_catalog_and_assessment_fail_closed_without_reflecting_canaries(
+    monkeypatch,
+):
+    secret = "sk-route-catalog-secret-canary"
+    url = "https://route-secret.invalid/private"
+    path = "/private/route/credentials.json"
+    parent = _parent()
+    service = SubagentLifecycleService(lambda: parent)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: (_ for _ in ()).throw(RuntimeError(f"{secret} {url} {path}")),
+    )
+
+    catalog = service.catalog_routes()
+    assert catalog.complete is False
+    assert catalog.routes == ()
+    assert catalog.candidate_count == 0
+    assert catalog.reason == "CATALOG_UNAVAILABLE"
+    assert catalog.assessed_at > 0
+    assert re.fullmatch(r"snap_[0-9a-f]{32}", catalog.snapshot_id)
+
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_delegation_credentials",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError(f"{secret} {url} {path}")
+        ),
+    )
+    assessment = service.assess_route("synthetic", "model-a")
+    assert assessment.eligible is False
+    assert assessment.reason == "ROUTE_UNAVAILABLE"
+    assert assessment.transport == "unavailable"
+    assert assessment.authenticated is False
+    assert assessment.agent_capable is False
+    assert assessment.exact_empty_model_tools is False
+    assert assessment.mutation_evidence_complete is False
+    assert assessment.assessed_at > 0
+    assert re.fullmatch(r"asm_[0-9a-f]{32}", assessment.assessment_id)
+    public = repr((catalog, assessment))
+    assert secret not in public
+    assert url not in public
+    assert path not in public
+
+    with pytest.raises(SubagentLifecycleError) as url_error:
+        service.assess_route(url, "model-a")
+    assert url not in str(url_error.value)
+
+
+def test_route_catalog_marks_unverified_custom_or_partial_inventory_incomplete(
+    monkeypatch,
+):
+    parent = _parent()
+    service = SubagentLifecycleService(lambda: parent)
+    monkeypatch.setattr(
+        "tools.delegate_tool._catalog_subagent_routes",
+        lambda _parent: (_ for _ in ()).throw(
+            OverflowError("configured route inventory is incomplete")
+        ),
+    )
+
+    catalog = service.catalog_routes()
+
+    assert catalog.complete is False
+    assert catalog.routes == ()
+    assert catalog.reason == "CATALOG_INCOMPLETE"
+
+
+def test_public_route_identifiers_enforce_exact_storage_boundary():
+    boundary = "m" * 200
+    assert lifecycle_contracts.SubagentRouteIdentity("synthetic", boundary).model == boundary
+
+    with pytest.raises(SubagentLifecycleError):
+        lifecycle_contracts.SubagentRouteIdentity("synthetic", "m" * 201)
+
+
+@pytest.mark.parametrize("field", ["provider", "model"])
+def test_route_assessment_preserves_exact_200_character_identity(
+    monkeypatch, field
+):
+    boundary = "r" * 200
+    route = {
+        "provider": boundary if field == "provider" else "synthetic",
+        "model": boundary if field == "model" else "model-a",
+        "api_mode": "chat_completions",
+    }
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+
+    receipt = delegate_tool._assess_native_read_only_route(route)
+
+    assert getattr(receipt, field) == boundary
+    assert receipt.eligible is True
+
+
+@pytest.mark.parametrize("field", ["provider", "model"])
+def test_route_assessment_rejects_201_character_identity(monkeypatch, field):
+    route = {
+        "provider": "r" * 201 if field == "provider" else "synthetic",
+        "model": "r" * 201 if field == "model" else "model-a",
+        "api_mode": "chat_completions",
+    }
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+
+    with pytest.raises(ValueError, match="bounded public identifier"):
+        delegate_tool._assess_native_read_only_route(route)
+
+
+def test_offline_catalog_requires_authoritative_scope_and_ignores_process_env(
+    monkeypatch, tmp_path,
+):
+    descriptors = [
+        SimpleNamespace(
+            slug="openrouter",
+            auth_type="api_key",
+            api_key_env_vars=("OPENROUTER_API_KEY",),
+            keyless=False,
+        ),
+        SimpleNamespace(
+            slug="openai-api",
+            auth_type="api_key",
+            api_key_env_vars=("OPENAI_API_KEY",),
+            keyless=False,
+        ),
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog", lambda: descriptors
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._PROVIDER_MODELS",
+        {"openai-api": ["gpt-safe"]},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.OPENROUTER_MODELS", [("poison-model", "")]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers={}, custom_providers=[], excluded_providers=[]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **_kwargs: pytest.fail("offline catalog must not call legacy picker"),
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool",
+        lambda *_args, **_kwargs: pytest.fail("offline catalog must not seed pools"),
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "process-poison-canary")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with pytest.raises(ValueError, match="authoritative"):
+        delegate_tool._catalog_subagent_routes(_parent())
+
+    token = set_authoritative_secret_scope({"OPENAI_API_KEY": "profile-key"})
+    try:
+        with pytest.raises(OverflowError, match="incomplete"):
+            delegate_tool._catalog_subagent_routes(
+                _parent(provider="openrouter", model="poison-model")
+            )
+        assert delegate_tool._catalog_subagent_routes(
+            _parent(provider="openai-api", model="gpt-safe")
+        ) == (
+            ("openai-api", "gpt-safe"),
+        )
+    finally:
+        reset_authoritative_secret_scope(token)
+
+
+@pytest.mark.parametrize(
+    "raw_process_credentials",
+    [False, True],
+)
+def test_bedrock_assessment_requires_authoritative_profile_credentials(
+    monkeypatch, tmp_path, raw_process_credentials
+):
+    model = "us.anthropic.claude-sonnet-4-6"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if raw_process_credentials:
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "raw-process-poison")
+    else:
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_PROFILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("agent.bedrock_adapter.has_aws_credentials", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug="bedrock", auth_type="aws_sdk",
+            api_key_env_vars=(), keyless=False,
+        )],
+    )
+    monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {"bedrock": [model]})
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "bedrock",
+            "model": model,
+            "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "api_key": "raw-process-poison" if raw_process_credentials else "aws-sdk",
+            "api_mode": "bedrock_converse",
+            "request_overrides": {},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "recognized": True,
+            "corrected_model": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    token = set_authoritative_secret_scope({})
+    try:
+        with pytest.raises(OverflowError, match="incomplete"):
+            delegate_tool._catalog_subagent_routes(
+                _parent(provider="bedrock", model=model)
+            )
+        assessment = SubagentLifecycleService(lambda: _parent()).assess_route(
+            "bedrock", model
+        )
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert assessment.reason == "ROUTE_UNAVAILABLE"
+    assert assessment.authenticated is False
+    assert assessment.agent_capable is False
+    assert assessment.eligible is False
+
+
+def test_bedrock_bound_profile_credentials_require_private_worker_bundle(
+    monkeypatch, tmp_path
+):
+    model = "us.anthropic.claude-sonnet-4-6"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers={}, custom_providers=[], excluded_providers=[]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug="bedrock", auth_type="aws_sdk",
+            api_key_env_vars=(), keyless=False,
+        )],
+    )
+    monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {"bedrock": [model]})
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "bedrock", "model": model,
+            "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "api_key": "aws-sdk", "api_mode": "bedrock_converse",
+            "request_overrides": {},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True, "recognized": True, "corrected_model": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    parent = _parent(provider="bedrock", model=model)
+    token = set_authoritative_secret_scope({
+        "AWS_ACCESS_KEY_ID": "profile-access-key",
+        "AWS_SECRET_ACCESS_KEY": "profile-secret-key",
+        "AWS_SESSION_TOKEN": "profile-session-token",
+    })
+    try:
+        with pytest.raises(OverflowError, match="incomplete"):
+            delegate_tool._catalog_subagent_routes(parent)
+        assessment = SubagentLifecycleService(lambda: parent).assess_route(
+            "bedrock", model
+        )
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert assessment.reason == "ROUTE_UNAVAILABLE"
+    assert assessment.eligible is False
+    assert assessment.authenticated is False
+    assert assessment.agent_capable is False
+
+
+def test_concurrent_poisoned_bedrock_profiles_never_assess_or_launch(
+    monkeypatch, tmp_path
+):
+    model = "us.anthropic.claude-sonnet-4-6"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "raw-default-bearer-poison")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "raw-default-access-poison")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "raw-default-secret-poison")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "raw-default-session-poison")
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug="bedrock", auth_type="aws_sdk",
+            api_key_env_vars=(), keyless=False,
+        )],
+    )
+    monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {"bedrock": [model]})
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "bedrock", "model": model,
+            "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "api_key": "aws-sdk", "api_mode": "bedrock_converse",
+            "request_overrides": {},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True, "recognized": True, "corrected_model": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    build_calls = []
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools",
+        lambda **kwargs: build_calls.append(kwargs),
+    )
+    scopes = (
+        {"AWS_BEARER_TOKEN_BEDROCK": "profile-a-bearer-canary"},
+        {
+            "AWS_ACCESS_KEY_ID": "profile-b-access-canary",
+            "AWS_SECRET_ACCESS_KEY": "profile-b-secret-canary",
+            "AWS_SESSION_TOKEN": "profile-b-session-canary",
+        },
+    )
+
+    def probe(index, scope):
+        parent = _parent(
+            provider="bedrock", model=model, session_id=f"bedrock-{index}"
+        )
+        service = SubagentLifecycleService(lambda: parent)
+        request = SubagentLaunchRequestV2(
+            api_contract_version=2,
+            base=SubagentLaunchRequest(goal="read only", model=model),
+            toolset_mode="exact",
+            exact_toolsets=(),
+            provider="bedrock",
+        )
+        token = set_authoritative_secret_scope(scope)
+        try:
+            assessment = service.assess_route("bedrock", model)
+            with pytest.raises(SubagentLifecycleError) as caught:
+                service.launch(request)
+            return assessment, str(caught.value)
+        finally:
+            reset_authoritative_secret_scope(token)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = tuple(pool.map(lambda item: probe(*item), enumerate(scopes)))
+
+    assert all(receipt.reason == "ROUTE_UNAVAILABLE" for receipt, _ in receipts)
+    assert all(receipt.eligible is False for receipt, _ in receipts)
+    assert all(
+        error == "Requested provider/model route is unavailable."
+        for _, error in receipts
+    )
+    assert build_calls == []
+    assert delegation_admission.active_background_units() == 0
+
+
+def test_vertex_catalog_and_assessment_share_unprovable_offline_auth(
+    monkeypatch, tmp_path
+):
+    model = "google/gemini-3.1-pro-preview"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers={}, custom_providers=[], excluded_providers=[]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug="vertex", auth_type="vertex", api_key_env_vars=(), keyless=False,
+        )],
+    )
+    monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {"vertex": [model]})
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "vertex", "model": model,
+            "base_url": "https://vertex.invalid/v1",
+            "api_key": "minted-but-unproven-token",
+            "api_mode": "chat_completions", "request_overrides": {},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True, "recognized": True, "corrected_model": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    parent = _parent(provider="vertex", model=model)
+    token = set_authoritative_secret_scope({
+        "VERTEX_CREDENTIALS_PATH": "/profile/credential-canary.json",
+        "VERTEX_PROJECT_ID": "profile-project",
+    })
+    try:
+        with pytest.raises(OverflowError, match="incomplete"):
+            delegate_tool._catalog_subagent_routes(parent)
+        assessment = SubagentLifecycleService(lambda: parent).assess_route(
+            "vertex", model
+        )
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert assessment.reason == "ROUTE_UNAVAILABLE"
+    assert assessment.authenticated is False
+    assert assessment.agent_capable is False
+
+
+def test_offline_catalog_does_not_repair_malformed_profile_auth(
+    monkeypatch, tmp_path
+):
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text("{malformed-secret-canary", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers={}, custom_providers=[], excluded_providers=[]
+            )
+        ),
+    )
+    token = set_authoritative_secret_scope({})
+    try:
+        with pytest.raises(OverflowError, match="incomplete"):
+            delegate_tool._catalog_subagent_routes(_parent())
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert auth_path.read_text(encoding="utf-8") == "{malformed-secret-canary"
+    assert not (tmp_path / "auth.json.corrupt").exists()
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+def test_offline_catalog_requires_fresh_profile_local_oauth(
+    monkeypatch, tmp_path, fresh
+):
+    expires_at = time.time() + (3600 if fresh else -3600)
+    (tmp_path / "auth.json").write_text(
+        json.dumps({
+            "providers": {
+                "openai-codex": {
+                    "source": "device_code",
+                    "access_token": "profile-oauth-canary",
+                    "expires_at": expires_at,
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers={}, custom_providers=[], excluded_providers=[]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug="openai-codex",
+            auth_type="oauth_external",
+            api_key_env_vars=(),
+            keyless=False,
+        )],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._PROVIDER_MODELS", {"openai-codex": ["gpt-safe"]}
+    )
+    token = set_authoritative_secret_scope({})
+    try:
+        if fresh:
+            assert delegate_tool._catalog_subagent_routes(
+                _parent(provider="openai-codex", model="gpt-safe")
+            ) == (
+                ("openai-codex", "gpt-safe"),
+            )
+        else:
+            with pytest.raises(OverflowError, match="incomplete"):
+                delegate_tool._catalog_subagent_routes(
+                    _parent(provider="openai-codex", model="gpt-safe")
+                )
+    finally:
+        reset_authoritative_secret_scope(token)
+
+
+def _profile_tree_snapshot(root):
+    snapshot = []
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            snapshot.append((relative, "symlink", os.readlink(path)))
+        elif path.is_file():
+            snapshot.append((relative, "file", path.read_bytes(), path.stat().st_mode))
+        else:
+            snapshot.append((relative, "dir", path.stat().st_mode))
+    return snapshot
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_offline_catalog_never_mutates_fresh_profile_tree(
+    monkeypatch, tmp_path, malformed
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    if malformed:
+        (profile / "config.yaml").write_text("{malformed", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: pytest.fail("offline catalog must not use mutating config loader"),
+    )
+    monkeypatch.setattr("hermes_cli.provider_catalog.provider_catalog", lambda: [])
+    before = _profile_tree_snapshot(profile)
+    token = set_authoritative_secret_scope({})
+    try:
+        if malformed:
+            with pytest.raises(OverflowError, match="incomplete"):
+                delegate_tool._catalog_subagent_routes(_parent(provider="", model=""))
+        else:
+            assert delegate_tool._catalog_subagent_routes(
+                _parent(provider="", model="")
+            ) == ()
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert _profile_tree_snapshot(profile) == before
+
+
+def test_offline_catalog_rejects_config_final_symlink(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    other = tmp_path / "other-config.yaml"
+    other.write_text("model: {provider: openai-api}\n", encoding="utf-8")
+    (profile / "config.yaml").symlink_to(other)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    before = _profile_tree_snapshot(tmp_path)
+    token = set_authoritative_secret_scope({})
+    try:
+        with pytest.raises(OverflowError, match="incomplete"):
+            delegate_tool._catalog_subagent_routes(_parent(provider="", model=""))
+    finally:
+        reset_authoritative_secret_scope(token)
+    assert _profile_tree_snapshot(tmp_path) == before
+
+
+def test_offline_catalog_rejects_config_final_component_swap(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    config_path = profile / "config.yaml"
+    original_path = profile / "config.original.yaml"
+    config_path.write_text("model: {provider: openai-api}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    real_open = delegate_tool.os.open
+    swapped = False
+
+    def swap_then_open(path, flags, *args):
+        nonlocal swapped
+        if str(path) == str(config_path) and not swapped:
+            swapped = True
+            os.replace(config_path, original_path)
+            config_path.write_text("providers: {victim: {model: stolen}}\n", encoding="utf-8")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(delegate_tool.os, "open", swap_then_open)
+    token = set_authoritative_secret_scope({})
+    try:
+        with pytest.raises(OverflowError, match="incomplete"):
+            delegate_tool._catalog_subagent_routes(_parent(provider="", model=""))
+    finally:
+        reset_authoritative_secret_scope(token)
+    assert swapped is True
+
+
+def test_offline_catalog_rejects_non_string_excluded_provider(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "model_catalog:\n  excluded_providers:\n    - 7\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug="opencode-free",
+            auth_type="api_key",
+            api_key_env_vars=(),
+            keyless=True,
+        )],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._PROVIDER_MODELS", {"opencode-free": ["model-a"]}
+    )
+    service = SubagentLifecycleService(
+        lambda: _parent(provider="opencode-free", model="model-a")
+    )
+    token = set_authoritative_secret_scope({})
+    try:
+        catalog = service.catalog_routes()
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert catalog.complete is False
+    assert catalog.routes == ()
+    assert catalog.candidate_count == 0
+    assert catalog.reason == "CATALOG_INCOMPLETE"
+
+
+@pytest.mark.parametrize(
+    ("provider", "auth_type", "env_names", "keyless", "scope"),
+    [
+        ("opencode-free", "api_key", (), True, {}),
+        ("openai-api", "api_key", ("OPENAI_API_KEY",), False,
+         {"OPENAI_API_KEY": "scoped-key-canary"}),
+        ("bedrock", "aws_sdk", (), False, {
+            "AWS_ACCESS_KEY_ID": "scoped-access-canary",
+            "AWS_SECRET_ACCESS_KEY": "scoped-secret-canary",
+        }),
+    ],
+)
+def test_malformed_profile_auth_dominates_positive_provider_evidence(
+    monkeypatch, tmp_path, provider, auth_type, env_names, keyless, scope
+):
+    model = "model-a"
+    (tmp_path / "auth.json").write_text(
+        json.dumps({"providers": {provider: "malformed-entry"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug=provider,
+            auth_type=auth_type,
+            api_key_env_vars=env_names,
+            keyless=keyless,
+        )],
+    )
+    monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {provider: [model]})
+    service = SubagentLifecycleService(
+        lambda: _parent(provider=provider, model=model)
+    )
+    token = set_authoritative_secret_scope(scope)
+    try:
+        catalog = service.catalog_routes()
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert catalog.complete is False
+    assert catalog.routes == ()
+    assert catalog.candidate_count == 0
+    assert catalog.reason == "CATALOG_INCOMPLETE"
+
+
+@pytest.mark.parametrize(
+    ("provider", "auth_type", "env_names", "keyless", "scope"),
+    [
+        ("opencode-free", "api_key", (), True, {}),
+        ("openai-api", "api_key", ("OPENAI_API_KEY",), False,
+         {"OPENAI_API_KEY": "scoped-key-canary"}),
+        ("bedrock", "aws_sdk", (), False, {
+            "AWS_ACCESS_KEY_ID": "scoped-access-canary",
+            "AWS_SECRET_ACCESS_KEY": "scoped-secret-canary",
+        }),
+    ],
+)
+def test_malformed_profile_config_dominates_positive_provider_evidence(
+    monkeypatch, tmp_path, provider, auth_type, env_names, keyless, scope
+):
+    model = "model-a"
+    (tmp_path / "config.yaml").write_text(
+        f"{provider}: malformed-entry\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug=provider,
+            auth_type=auth_type,
+            api_key_env_vars=env_names,
+            keyless=keyless,
+        )],
+    )
+    monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {provider: [model]})
+    service = SubagentLifecycleService(
+        lambda: _parent(provider=provider, model=model)
+    )
+    token = set_authoritative_secret_scope(scope)
+    try:
+        catalog = service.catalog_routes()
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert catalog.complete is False
+    assert catalog.routes == ()
+    assert catalog.candidate_count == 0
+    assert catalog.reason == "CATALOG_INCOMPLETE"
+
+
+@pytest.mark.parametrize("clock_value", [float("nan"), float("inf"), -1.0])
+def test_public_route_receipt_timestamp_stays_bounded_on_invalid_host_clock(
+    monkeypatch, clock_value
+):
+    monkeypatch.setattr(lifecycle_contracts.time, "time", lambda: clock_value)
+
+    catalog = lifecycle_contracts._new_route_catalog(
+        complete=True, routes=(), candidate_count=0, reason="COMPLETE"
+    )
+
+    assert 0 < catalog.assessed_at <= 253_402_300_799.0
+
+
+@pytest.mark.parametrize(
+    ("model", "complete"),
+    [("m" * 200, True), ("m" * 201, False)],
+)
+def test_route_catalog_enforces_exact_storage_identifier_boundary(
+    monkeypatch, model, complete
+):
+    parent = _parent()
+    service = SubagentLifecycleService(lambda: parent)
+    def catalog(_parent):
+        if len(model) > 200:
+            raise OverflowError("route inventory is incomplete")
+        return (("synthetic", model),)
+
+    monkeypatch.setattr("tools.delegate_tool._catalog_subagent_routes", catalog)
+
+    catalog = service.catalog_routes()
+
+    assert catalog.complete is complete
+    if complete:
+        assert catalog.routes == (
+            lifecycle_contracts.SubagentRouteIdentity("synthetic", model),
+        )
+    else:
+        assert catalog.routes == ()
+        assert catalog.reason == "CATALOG_INCOMPLETE"
 
 
 def test_v2_route_and_reasoning_use_host_resolution_without_public_secrets(
@@ -690,18 +1531,30 @@ def test_native_read_only_receipt_binds_bounded_model_and_model_mismatch_cleans_
 ):
     from tools.delegate_tool import _assess_native_read_only_route
 
+    with pytest.raises(ValueError, match="bounded public identifier"):
+        _assess_native_read_only_route(
+            {
+                "provider": "p" * 201,
+                "model": "m" * 201,
+                "api_mode": "chat_completions",
+                "command": None,
+                "args": [],
+            }
+        )
+
     receipt = _assess_native_read_only_route(
         {
-            "provider": "p" * 1024,
-            "model": "m" * 1024,
+            "provider": "p" * 200,
+            "model": "m" * 200,
             "api_mode": "chat_completions",
             "command": None,
             "args": [],
         }
     )
-    assert len(receipt.provider) <= 128
-    assert len(receipt.model) <= 128
+    assert len(receipt.provider) == 200
+    assert len(receipt.model) == 200
     assert receipt.transport == "chat_completions"
+    assert receipt.mutation_evidence_complete is True
     with pytest.raises(dataclasses.FrozenInstanceError):
         receipt.model = "forged-model"
 
@@ -741,6 +1594,30 @@ def test_native_read_only_receipt_binds_bounded_model_and_model_mismatch_cleans_
     assert built[0].closed is True
     assert ran == []
     assert delegation_admission.active_background_units() == 0
+
+
+def test_route_assessment_exposes_incomplete_exact_empty_evidence_fail_closed(
+    monkeypatch,
+):
+    _install_route(monkeypatch)
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools",
+        lambda: (_ for _ in ()).throw(RuntimeError("private resolver detail")),
+    )
+
+    assessment = SubagentLifecycleService(lambda: _parent()).assess_route(
+        "synthetic", "model-a"
+    )
+
+    assert assessment.eligible is False
+    assert assessment.reason == "MUTATION_CHANNEL_UNAVAILABLE"
+    assert assessment.transport == "chat_completions"
+    assert assessment.authenticated is True
+    assert assessment.agent_capable is True
+    assert assessment.exact_empty_model_tools is False
+    assert assessment.mutation_evidence_complete is False
+    assert assessment.independent_mutation_channels == frozenset()
+    assert assessment.hermes_model_tool_count == 0
 
 
 def test_bound_plugin_launch_anchors_two_concurrent_manager_profiles(

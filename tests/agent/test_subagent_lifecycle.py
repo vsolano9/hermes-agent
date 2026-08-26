@@ -23,6 +23,26 @@ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from tools.registry import registry
 
 
+def _public_route_assessment(**overrides):
+    values = {
+        "api_contract_version": lifecycle_module.LIFECYCLE_API_CONTRACT_VERSION,
+        "route": lifecycle_module.SubagentRouteIdentity("synthetic", "model-a"),
+        "eligible": True,
+        "reason": "ELIGIBLE",
+        "transport": "chat_completions",
+        "authenticated": True,
+        "agent_capable": True,
+        "exact_empty_model_tools": True,
+        "mutation_evidence_complete": True,
+        "independent_mutation_channels": frozenset(),
+        "hermes_model_tool_count": 0,
+        "assessed_at": 1.0,
+        "assessment_id": "asm_00000000000000000000000000000000",
+    }
+    values.update(overrides)
+    return lifecycle_module.SubagentRouteAssessment(**values)
+
+
 @pytest.fixture(autouse=True)
 def _clean_delegation_admission():
     from tools import delegation_admission
@@ -30,6 +50,93 @@ def _clean_delegation_admission():
     delegation_admission._reset_for_tests()
     yield
     delegation_admission._reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"eligible": False, "reason": "MUTATION_CHANNEL_UNAVAILABLE"},
+        {
+            "eligible": False,
+            "reason": "MUTATION_CHANNEL_UNAVAILABLE",
+            "authenticated": False,
+            "independent_mutation_channels": frozenset({"EXTERNAL_PROCESS"}),
+        },
+        {
+            "eligible": False,
+            "reason": "MUTATION_CHANNEL_UNAVAILABLE",
+            "agent_capable": False,
+            "independent_mutation_channels": frozenset({"EXTERNAL_PROCESS"}),
+        },
+        {
+            "eligible": False,
+            "reason": "MUTATION_CHANNEL_UNAVAILABLE",
+            "transport": "unknown",
+        },
+        {
+            "eligible": False,
+            "reason": "MUTATION_CHANNEL_UNAVAILABLE",
+            "independent_mutation_channels": frozenset({"UNKNOWN_TRANSPORT"}),
+        },
+        {
+            "eligible": False,
+            "reason": "MUTATION_CHANNEL_UNAVAILABLE",
+            "exact_empty_model_tools": False,
+            "hermes_model_tool_count": 1,
+        },
+        {
+            "eligible": False,
+            "reason": "MUTATION_CHANNEL_UNAVAILABLE",
+            "exact_empty_model_tools": False,
+            "mutation_evidence_complete": False,
+            "hermes_model_tool_count": 1,
+        },
+        {
+            "eligible": False,
+            "reason": "MUTATION_CHANNEL_UNAVAILABLE",
+            "exact_empty_model_tools": False,
+            "mutation_evidence_complete": False,
+            "independent_mutation_channels": frozenset({"HERMES_MODEL_TOOLS"}),
+        },
+    ],
+)
+def test_route_assessment_rejects_semantically_impossible_unavailable_receipts(
+    overrides,
+):
+    with pytest.raises(SubagentLifecycleError, match="Malformed"):
+        _public_route_assessment(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "transport": "unknown",
+            "independent_mutation_channels": frozenset({"UNKNOWN_TRANSPORT"}),
+        },
+        {
+            "independent_mutation_channels": frozenset({"EXTERNAL_PROCESS"}),
+        },
+        {
+            "exact_empty_model_tools": False,
+            "hermes_model_tool_count": 2,
+            "independent_mutation_channels": frozenset({"HERMES_MODEL_TOOLS"}),
+        },
+        {
+            "exact_empty_model_tools": False,
+            "mutation_evidence_complete": False,
+        },
+    ],
+)
+def test_route_assessment_accepts_each_exact_unavailable_blocker(overrides):
+    assessment = _public_route_assessment(
+        eligible=False,
+        reason="MUTATION_CHANNEL_UNAVAILABLE",
+        **overrides,
+    )
+
+    assert assessment.eligible is False
+    assert assessment.reason == "MUTATION_CHANNEL_UNAVAILABLE"
 
 
 class FakeChild:
@@ -112,7 +219,7 @@ def test_cancel_is_cooperative_and_forged_handle_is_unknown(lifecycle):
 def test_capabilities_are_immutable_and_version_api_separately_from_handle(lifecycle):
     capabilities = lifecycle.capabilities()
 
-    assert capabilities.api_contract_version == 2
+    assert capabilities.api_contract_version == 3
     assert capabilities.handle_serialization_version == 1
     assert capabilities.features == frozenset(
         {
@@ -130,6 +237,9 @@ def test_capabilities_are_immutable_and_version_api_separately_from_handle(lifec
             "provider_routing",
             "reasoning_override",
             "native_read_only_transport_gate",
+            "route_catalog",
+            "route_assessment",
+            "root_execution_context",
         }
     )
     assert capabilities.providers_are_host_resolved is True
@@ -430,7 +540,7 @@ def test_collect_is_not_ready_then_stable_idempotent_and_owner_content_is_bounde
     assert entered.wait(timeout=5)
 
     pending = service.collect(handle)
-    assert pending.api_contract_version == 2
+    assert pending.api_contract_version == 3
     assert pending.handle_serialization_version == 1
     assert pending.ready is False
     assert pending.terminal_state is None

@@ -35,6 +35,7 @@ from tools.registry import (
     CHECK_FN_CACHE_BYPASS,
     check_fn_cache_scope,
     discover_builtin_tools,
+    root_execution_context_for_definitions,
     registry,
     tool_error,
 )
@@ -373,6 +374,7 @@ def get_tool_definitions(
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
+                root_execution_context_for_definitions(),
                 profile_scope,
             )
         with _tool_defs_cache_lock:

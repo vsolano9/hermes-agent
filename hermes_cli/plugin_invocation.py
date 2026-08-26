@@ -32,13 +32,15 @@ from agent.subagent_lifecycle import (
     SubagentLifecycleService,
     SubagentReconnectResult,
     SubagentResult,
+    SubagentRouteAssessment,
+    SubagentRouteCatalog,
     SubagentState,
     SubagentStatus,
     SubagentTerminalState,
     _TERMINAL_RETENTION_SECONDS,
 )
 
-PLUGIN_INVOCATION_CONTRACT_VERSION = 1
+PLUGIN_INVOCATION_CONTRACT_VERSION = 2
 _TERMINAL_STATES = frozenset({
     SubagentState.SUCCEEDED,
     SubagentState.FAILED,
@@ -235,6 +237,24 @@ class BoundSubagentLifecycle:
         if binding is None:
             raise SubagentLifecycleError("Subagent lifecycle authority is unavailable.")
         return binding.service.capabilities()
+
+    def catalog_routes(self) -> SubagentRouteCatalog:
+        with _admitted_active_binding(self) as binding:
+            if binding is None:
+                raise SubagentLifecycleError(
+                    "Subagent lifecycle authority is unavailable."
+                )
+            with _binding_profile_scope(binding):
+                return binding.service.catalog_routes()
+
+    def assess_route(self, provider: str, model: str) -> SubagentRouteAssessment:
+        with _admitted_active_binding(self) as binding:
+            if binding is None:
+                raise SubagentLifecycleError(
+                    "Subagent lifecycle authority is unavailable."
+                )
+            with _binding_profile_scope(binding):
+                return binding.service.assess_route(provider, model)
 
     def list(self) -> tuple[SubagentStatus, ...]:
         with _admitted_active_binding(self) as binding:
@@ -700,7 +720,54 @@ class PluginToolInvocation:
     task_id: Optional[str]
     operation_id: str
     profile_name: str
+    execution_kind: str
+    delegation_depth: int
+    delegation_role: str
+    platform: str
     subagents: BoundSubagentLifecycle
+
+
+def _bounded_public_execution_identifier(value: Any, *, fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    normalized = value.strip().lower()
+    if (
+        not normalized
+        or len(normalized) > 64
+        or any(
+            not character.isascii()
+            or not (character.isalnum() or character in {"-", "_"})
+            for character in normalized
+        )
+    ):
+        return fallback
+    return normalized
+
+
+def _host_execution_identity(binding: _Binding) -> tuple[str, int, str, str]:
+    """Derive bounded invocation context from the active host parent only."""
+    from agent.delegation_context import classify_delegation_depth
+
+    parent = binding.parent_resolver()
+    if parent is None:
+        execution_kind, depth = classify_delegation_depth(None)
+        return execution_kind, depth, "unknown", "unknown"
+
+    execution_kind, depth = classify_delegation_depth(
+        getattr(parent, "_delegate_depth", None)
+    )
+    if execution_kind == "delegated":
+        role = _bounded_public_execution_identifier(
+            getattr(parent, "_delegate_role", "leaf"), fallback="leaf"
+        )
+        if role not in {"leaf", "orchestrator"}:
+            role = "leaf"
+    else:
+        role = "root" if execution_kind == "root" else "unknown"
+    platform = _bounded_public_execution_identifier(
+        getattr(parent, "platform", "unknown"), fallback="unknown"
+    )
+    return execution_kind, depth, role, platform
 
 
 def _make_plugin_tool_invocation(
@@ -717,6 +784,9 @@ def _make_plugin_tool_invocation(
     if lease is None or not lease.authorizes(binding.root):
         raise SubagentLifecycleError("Plugin lifecycle authority is unavailable.")
     operation_id = lease.operation_id
+    execution_kind, delegation_depth, delegation_role, platform = (
+        _host_execution_identity(binding)
+    )
     return PluginToolInvocation(
         invocation_contract_version=PLUGIN_INVOCATION_CONTRACT_VERSION,
         plugin_id=binding.root.authority.plugin_id,
@@ -724,6 +794,10 @@ def _make_plugin_tool_invocation(
         task_id=str(task_id) if task_id is not None else None,
         operation_id=operation_id,
         profile_name=profile_name,
+        execution_kind=execution_kind,
+        delegation_depth=delegation_depth,
+        delegation_role=delegation_role,
+        platform=platform,
         subagents=_mint_invocation_facade(
             subagents,
             session_id=session_id,

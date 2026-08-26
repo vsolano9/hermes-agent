@@ -26,6 +26,32 @@ import yaml
 _HOST_TIMEOUT = 45
 
 
+def test_public_task7_contract_is_generic_and_additive():
+    from agent.subagent_lifecycle import (
+        SubagentRouteAssessment,
+        SubagentRouteCatalog,
+        SubagentRouteIdentity,
+    )
+    from hermes_cli.plugin_invocation import PluginToolInvocation
+
+    assert tuple(SubagentRouteIdentity.__dataclass_fields__) == ("provider", "model")
+    assert {
+        "route", "eligible", "reason", "transport", "authenticated",
+        "agent_capable", "exact_empty_model_tools",
+        "mutation_evidence_complete", "independent_mutation_channels",
+        "hermes_model_tool_count", "assessed_at", "assessment_id",
+    } <= set(SubagentRouteAssessment.__dataclass_fields__)
+    assert {
+        "complete", "routes", "candidate_count", "reason", "assessed_at",
+        "snapshot_id",
+    } <= set(
+        SubagentRouteCatalog.__dataclass_fields__
+    )
+    assert {
+        "execution_kind", "delegation_depth", "delegation_role", "platform",
+    } <= set(PluginToolInvocation.__dataclass_fields__)
+
+
 def _isolated_config(base_url: str) -> dict:
     return {
         "model": {"default": "parent-model", "provider": "custom:parent",

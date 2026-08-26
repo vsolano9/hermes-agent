@@ -73,7 +73,7 @@ def test_explicit_invocation_parameter_receives_dispatch_identity(tmp_path, monk
         args, invocation, kwargs = seen[0]
         assert args == {"value": 1}
         assert isinstance(invocation, PluginToolInvocation)
-        assert invocation.invocation_contract_version == 1
+        assert invocation.invocation_contract_version == 2
         assert invocation.plugin_id == "invocation-probe"
         assert invocation.session_id == "session-1"
         assert invocation.task_id == "turn-a"
@@ -100,6 +100,422 @@ def test_explicit_invocation_parameter_receives_dispatch_identity(tmp_path, monk
     finally:
         assert registration is not None
         registration.dispose()
+
+
+def test_invocation_execution_identity_is_host_derived_and_sanitized(
+    tmp_path, monkeypatch
+):
+    context, manager = _context(tmp_path, "execution-identity")
+    seen = []
+
+    def handler(_args, *, invocation):
+        seen.append(invocation)
+        return "ok"
+
+    registration = context.register_tool(
+        "_execution_identity_probe",
+        "debugging",
+        _schema("_execution_identity_probe"),
+        handler,
+    )
+    parent = SimpleNamespace(
+        session_id="identity-session",
+        _delegate_depth=2,
+        _delegate_role="orchestrator",
+        platform="telegram",
+    )
+    monkeypatch.setenv("HERMES_DELEGATION_DEPTH", "999")
+    monkeypatch.setenv("HERMES_PLATFORM", "secret-env-platform")
+    try:
+        with bind_subagent_parent(parent):
+            assert registry.dispatch(
+                "_execution_identity_probe",
+                {},
+                scope=manager.scope_key,
+                session_id="identity-session",
+                task_id="identity-turn",
+            ) == "ok"
+        invocation = seen[0]
+        assert invocation.invocation_contract_version == 2
+        assert invocation.execution_kind == "delegated"
+        assert invocation.delegation_depth == 2
+        assert invocation.delegation_role == "orchestrator"
+        assert invocation.platform == "telegram"
+        assert "secret-env-platform" not in repr(invocation)
+    finally:
+        assert registration is not None
+        registration.dispose()
+
+
+@pytest.mark.parametrize("raw_depth", [None, [], -1, True])
+def test_malformed_host_depth_mints_unknown_non_root_invocation(
+    tmp_path, raw_depth
+):
+    context, manager = _context(tmp_path, f"unknown-depth-{type(raw_depth).__name__}")
+    seen = []
+
+    registration = context.register_tool(
+        "_unknown_execution_identity_probe",
+        "debugging",
+        _schema("_unknown_execution_identity_probe"),
+        lambda _args, *, invocation: seen.append(invocation) or "ok",
+    )
+    parent = SimpleNamespace(
+        session_id="unknown-session",
+        _delegate_depth=raw_depth,
+        _delegate_role="root",
+        platform="cli",
+    )
+    try:
+        with bind_subagent_parent(parent):
+            assert registry.dispatch(
+                "_unknown_execution_identity_probe",
+                {},
+                scope=manager.scope_key,
+                session_id="unknown-session",
+                task_id="unknown-turn",
+            ) == "ok"
+        assert seen[0].execution_kind == "unknown"
+        assert seen[0].delegation_depth == -1
+        assert seen[0].delegation_role == "unknown"
+    finally:
+        registration.dispose()
+
+
+@pytest.mark.parametrize("raw_depth", [65, 10**100])
+def test_every_positive_host_depth_remains_delegated(tmp_path, raw_depth):
+    context, manager = _context(tmp_path, f"positive-depth-{raw_depth}")
+    seen = []
+    registration = context.register_tool(
+        "_positive_execution_identity_probe",
+        "debugging",
+        _schema("_positive_execution_identity_probe"),
+        lambda _args, *, invocation: seen.append(invocation) or "ok",
+    )
+    parent = SimpleNamespace(
+        session_id="positive-session",
+        _delegate_depth=raw_depth,
+        _delegate_role="orchestrator",
+        platform="cli",
+    )
+    try:
+        with bind_subagent_parent(parent):
+            assert registry.dispatch(
+                "_positive_execution_identity_probe",
+                {},
+                scope=manager.scope_key,
+                session_id="positive-session",
+                task_id="positive-turn",
+            ) == "ok"
+        assert seen[0].execution_kind == "delegated"
+        assert seen[0].delegation_depth == raw_depth
+        assert seen[0].delegation_role == "orchestrator"
+    finally:
+        registration.dispose()
+
+
+def test_missing_host_depth_mints_unknown_non_root_invocation(tmp_path):
+    context, manager = _context(tmp_path, "missing-depth")
+    seen = []
+    registration = context.register_tool(
+        "_missing_execution_identity_probe",
+        "debugging",
+        _schema("_missing_execution_identity_probe"),
+        lambda _args, *, invocation: seen.append(invocation) or "ok",
+    )
+    parent = SimpleNamespace(session_id="missing-session", platform="cli")
+    try:
+        with bind_subagent_parent(parent):
+            assert registry.dispatch(
+                "_missing_execution_identity_probe",
+                {},
+                scope=manager.scope_key,
+                session_id="missing-session",
+                task_id="missing-turn",
+            ) == "ok"
+        assert seen[0].execution_kind == "unknown"
+        assert seen[0].delegation_depth == -1
+        assert seen[0].delegation_role == "unknown"
+    finally:
+        registration.dispose()
+
+
+def test_bound_route_reads_require_active_authority_and_revoke_with_unload(
+    tmp_path, monkeypatch
+):
+    context, manager = _context(tmp_path, "route-authority")
+    retained = []
+
+    def handler(_args, *, invocation):
+        retained.append(invocation.subagents)
+        catalog = invocation.subagents.catalog_routes()
+        return json.dumps({"complete": catalog.complete})
+
+    registration = context.register_tool(
+        "_route_authority_probe",
+        "debugging",
+        _schema("_route_authority_probe"),
+        handler,
+    )
+    parent = SimpleNamespace(
+        session_id="route-session", provider="synthetic", model="model-a",
+        _delegate_depth=0, platform="cli",
+    )
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService.catalog_routes",
+        lambda self: lifecycle_module.SubagentRouteCatalog(
+            api_contract_version=3,
+            complete=True,
+            routes=(),
+            candidate_count=0,
+            reason="COMPLETE",
+            assessed_at=1.0,
+            snapshot_id="snap_00000000000000000000000000000000",
+        ),
+    )
+    try:
+        with bind_subagent_parent(parent):
+            assert json.loads(registry.dispatch(
+                "_route_authority_probe", {}, scope=manager.scope_key,
+                session_id="route-session", task_id="route-turn",
+            )) == {"complete": True}
+        with pytest.raises(SubagentLifecycleError):
+            retained[0].catalog_routes()
+        plugin_invocation_module._revoke_bound_subagent_lifecycle(
+            context.subagent_lifecycle
+        )
+        with bind_subagent_parent(parent), pytest.raises(SubagentLifecycleError):
+            retained[0].catalog_routes()
+    finally:
+        if registration is not None and registration.active:
+            registration.dispose()
+
+
+def test_route_catalog_admission_drains_before_unload_revokes(tmp_path, monkeypatch):
+    context, manager = _context(tmp_path, "route-unload-race")
+    entered = threading.Event()
+    release = threading.Event()
+    retained = []
+    outcomes = []
+
+    def catalog(_service):
+        entered.set()
+        assert release.wait(timeout=5)
+        return lifecycle_module.SubagentRouteCatalog(
+            api_contract_version=3,
+            complete=True,
+            routes=(),
+            candidate_count=0,
+            reason="COMPLETE",
+            assessed_at=1.0,
+            snapshot_id="snap_00000000000000000000000000000000",
+        )
+
+    def handler(_args, *, invocation):
+        retained.append(invocation.subagents)
+        return invocation.subagents.catalog_routes().reason
+
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService.catalog_routes", catalog
+    )
+    registration = context.register_tool(
+        "_route_unload_race",
+        "debugging",
+        _schema("_route_unload_race"),
+        handler,
+    )
+    parent = SimpleNamespace(session_id="route-race", _delegate_depth=0)
+
+    def dispatch():
+        with bind_subagent_parent(parent):
+            outcomes.append(
+                registry.dispatch(
+                    "_route_unload_race",
+                    {},
+                    scope=manager.scope_key,
+                    session_id="route-race",
+                    task_id="route-race-turn",
+                )
+            )
+
+    dispatch_thread = threading.Thread(target=dispatch)
+    revoke_thread = threading.Thread(
+        target=plugin_invocation_module._revoke_bound_subagent_lifecycle,
+        args=(context.subagent_lifecycle,),
+    )
+    try:
+        dispatch_thread.start()
+        assert entered.wait(timeout=5)
+        revoke_thread.start()
+        revoke_thread.join(timeout=0.05)
+        assert revoke_thread.is_alive()
+        release.set()
+        dispatch_thread.join(timeout=5)
+        revoke_thread.join(timeout=5)
+        assert outcomes == ["COMPLETE"]
+        assert not dispatch_thread.is_alive()
+        assert not revoke_thread.is_alive()
+        with bind_subagent_parent(parent), pytest.raises(SubagentLifecycleError):
+            retained[0].catalog_routes()
+    finally:
+        release.set()
+        dispatch_thread.join(timeout=5)
+        revoke_thread.join(timeout=5)
+        if registration is not None and registration.active:
+            registration.dispose()
+
+
+def test_concurrent_bound_catalogs_use_only_each_authoritative_profile(
+    tmp_path, monkeypatch
+):
+    context_a, manager_a = _context(
+        tmp_path, "catalog-profile-a", scope_name="catalog-a"
+    )
+    context_b, manager_b = _context(
+        tmp_path, "catalog-profile-b", scope_name="catalog-b"
+    )
+    (tmp_path / "catalog-a" / ".env").write_text(
+        "OPENAI_API_KEY=profile-a-secret\n", encoding="utf-8"
+    )
+    (tmp_path / "catalog-b" / ".env").write_text(
+        "ANTHROPIC_API_KEY=profile-b-secret\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "process-poison-secret")
+    descriptors = [
+        SimpleNamespace(
+            slug="openai-api", auth_type="api_key",
+            api_key_env_vars=("OPENAI_API_KEY",), keyless=False,
+        ),
+        SimpleNamespace(
+            slug="anthropic", auth_type="api_key",
+            api_key_env_vars=("ANTHROPIC_API_KEY",), keyless=False,
+        ),
+        SimpleNamespace(
+            slug="openrouter", auth_type="api_key",
+            api_key_env_vars=("OPENROUTER_API_KEY",), keyless=False,
+        ),
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog", lambda: descriptors
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._PROVIDER_MODELS",
+        {"openai-api": ["gpt-profile-a"], "anthropic": ["claude-profile-b"]},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.OPENROUTER_MODELS", [("poison-model", "")]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers={}, custom_providers=[], excluded_providers=[]
+            )
+        ),
+    )
+
+    def register(context, name):
+        return context.register_tool(
+            name,
+            "debugging",
+            _schema(name),
+            lambda _args, *, invocation: json.dumps([
+                [route.provider, route.model]
+                for route in invocation.subagents.catalog_routes().routes
+            ]),
+        )
+
+    registration_a = register(context_a, "_profile_a_catalog")
+    registration_b = register(context_b, "_profile_b_catalog")
+    parent_a = SimpleNamespace(
+        session_id="catalog-a", provider="openai-api", model="gpt-profile-a",
+        _delegate_depth=0,
+    )
+    parent_b = SimpleNamespace(
+        session_id="catalog-b", provider="anthropic", model="claude-profile-b",
+        _delegate_depth=0,
+    )
+
+    def dispatch(name, manager, parent, session):
+        with bind_subagent_parent(parent):
+            return registry.dispatch(
+                name, {}, scope=manager.scope_key, session_id=session,
+                task_id=f"{session}-turn",
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_a = executor.submit(
+                dispatch, "_profile_a_catalog", manager_a, parent_a, "catalog-a"
+            )
+            future_b = executor.submit(
+                dispatch, "_profile_b_catalog", manager_b, parent_b, "catalog-b"
+            )
+            assert json.loads(future_a.result(timeout=5)) == [
+                ["openai-api", "gpt-profile-a"]
+            ]
+            assert json.loads(future_b.result(timeout=5)) == [
+                ["anthropic", "claude-profile-b"]
+            ]
+    finally:
+        registration_a.dispose()
+        registration_b.dispose()
+
+
+def test_root_scoped_plugin_tool_is_hidden_and_denied_for_child(
+    tmp_path, monkeypatch
+):
+    context, manager = _context(tmp_path, "root-scope")
+    monkeypatch.setattr("tools.registry.hermes_home_key", lambda: manager.scope_key)
+    calls = []
+
+    def handler(_args, *, invocation):
+        calls.append(invocation.execution_kind)
+        return "root-ok"
+
+    registration = context.register_tool(
+        "_root_scope_probe",
+        "debugging",
+        _schema("_root_scope_probe"),
+        handler,
+        execution_scope="root",
+    )
+    root = SimpleNamespace(session_id="root-session", _delegate_depth=0)
+    child = SimpleNamespace(session_id="child-session", _delegate_depth=1)
+    try:
+        with bind_subagent_parent(root):
+            assert registry.get_definitions(
+                {"_root_scope_probe"}, quiet=True
+            )[0]["function"]["name"] == "_root_scope_probe"
+            assert registry.dispatch(
+                "_root_scope_probe",
+                {},
+                scope=manager.scope_key,
+                session_id="root-session",
+                task_id="root-turn",
+            ) == "root-ok"
+        with bind_subagent_parent(child):
+            assert registry.get_definitions({"_root_scope_probe"}, quiet=True) == []
+            denied = registry.dispatch(
+                "_root_scope_probe",
+                {},
+                scope=manager.scope_key,
+                session_id="child-session",
+                task_id="child-turn",
+            )
+        manual = registry.dispatch(
+            "_root_scope_probe",
+            {},
+            scope=manager.scope_key,
+            session_id="root-session",
+            task_id="stale-turn",
+        )
+        assert "root execution context" in denied
+        assert "root execution context" in manual
+        assert calls == ["root"]
+    finally:
+        registration.dispose()
+    assert registry.get_entry("_root_scope_probe", scope=manager.scope_key) is None
 
 
 def test_kwargs_alone_remains_exact_legacy_behavior(tmp_path):
@@ -801,7 +1217,7 @@ def test_v2_operations_are_turn_stable_direct_child_scoped_and_fail_closed(
             registration.dispose()
 
     capabilities, listed, queued, pending, foreign_steer, foreign_collect, stopped, terminal, legacy_status, legacy_cancel, first, second = turn_b_receipts[0]
-    assert capabilities.api_contract_version == 2
+    assert capabilities.api_contract_version == 3
     assert tuple(status.handle for status in listed) == (handles["owner"],)
     assert listed[0].audit_metadata.launch_task_id == "turn-a"
     assert listed[0].audit_metadata.operation_task_id == "turn-b-changed"
@@ -1892,6 +2308,7 @@ def test_public_agent_resolution_preserves_complete_tools_prompt_and_toolsets(
     legacy_enabled_toolsets = list(legacy_agent.enabled_toolsets)
     assert legacy_registration is not None
     legacy_registration.dispose()
+    opted_agent = None
 
     async def handler(args, *, invocation, **kwargs):
         await asyncio.sleep(0)
@@ -1944,6 +2361,9 @@ def test_public_agent_resolution_preserves_complete_tools_prompt_and_toolsets(
         assert build_system_prompt(opted_agent).encode() == opted_system_prompt_before
         assert parent.enabled_toolsets == toolsets_before
     finally:
+        if opted_agent is not None:
+            opted_agent.close()
+        legacy_agent.close()
         assert registration is not None
         registration.dispose()
 
