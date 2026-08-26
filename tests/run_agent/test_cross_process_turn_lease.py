@@ -196,6 +196,38 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
     assert db.events == []
 
 
+def test_turn_finally_releases_task_scoped_mcp_single_writer_lease(monkeypatch):
+    db = _DB(session_exists=False)
+    agent = _agent_with_db(db, session_id="fresh", platform="subagent")
+    agent._session_db_created = False
+    agent._parent_session_id = "parent"
+    agent._conversation_root_id = lambda: "parent"
+    released = []
+    grants_released = []
+
+    monkeypatch.setattr(
+        "agent.conversation_loop.run_conversation",
+        lambda *_args, **_kwargs: {
+            "final_response": "ok",
+            "messages": [],
+            "failed": False,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.mcp_tool.release_mcp_single_writer_leases",
+        lambda owner: released.append(owner),
+    )
+    monkeypatch.setattr(
+        "tools.mcp_tool.release_mcp_routine_grant",
+        lambda owner: grants_released.append(owner),
+    )
+
+    AIAgent.run_conversation(agent, "work", task_id="desktop-task")
+
+    assert released == ["desktop-task"]
+    assert grants_released == ["desktop-task"]
+
+
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
     db = _DB(acquire_result=False)
     agent = _agent_with_db(db)

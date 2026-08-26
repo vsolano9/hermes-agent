@@ -34,6 +34,7 @@ mcp_servers:
     timeout: 120
     connect_timeout: 60
     supports_parallel_tool_calls: false
+    single_writer: false
     tools:
       include: []
       exclude: []
@@ -58,6 +59,7 @@ mcp_servers:
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
 | `protocol` | string | both | Protocol-era negotiation: `auto` (default — legacy `initialize` handshake first, falling back to the 2026-07-28 `server/discover` stateless probe when the server rejects the handshake as modern-only), `stateless` (probe `server/discover` first; one legacy retry), or `legacy` (handshake only, no fallback) |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
+| `single_writer` | bool or mapping | both | Reserve this stateful server to one agent task at a time across every Hermes profile for the same OS account/UID. A mapping accepts `enabled` and `wait_timeout_seconds` (default `10`, range `0`–`60`). The legacy `idle_timeout_seconds` value is accepted but never steals an active OS lock. Malformed values refuse new registration without deleting an active lease. |
 | `skip_preflight` | bool | HTTP | Bypass the fail-fast content-type probe for valid Streamable HTTP endpoints whose HEAD/GET answers a non-MCP content type (default: `false`) |
 | `transport` | string | HTTP | Set to `sse` to use the SSE transport instead of Streamable HTTP |
 | `keepalive_interval` | number | both | Liveness ping cadence in seconds (default: `180`, floored at 5s). Set below the server's session TTL for servers that GC idle sessions quickly |
@@ -68,6 +70,31 @@ mcp_servers:
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
 | `trust` | string | both | Trust tier: `full` (default) or `untrusted`. On an `untrusted` server, every write-capable tool call (any tool without a `readOnlyHint: true` annotation) requires user approval through the standard approval surface before it runs. `readOnlyHint` is a server-supplied *hint* — a lying server can at most skip approval for tools it claims are read-only, never gain extra access — so mark any server you don't fully control as `untrusted`. Unrecognized values are treated as `untrusted` (fail-closed) |
+
+### Stateful single-writer servers
+
+Use `single_writer` for desktop, editor, or other stateful MCPs whose actions
+must not interleave across agent tasks:
+
+```yaml
+mcp_servers:
+  desktop:
+    command: /path/to/desktop-mcp
+    supports_parallel_tool_calls: false
+    single_writer:
+      enabled: true
+      wait_timeout_seconds: 4
+```
+
+Across processes for the same OS account/UID—even with different `HERMES_HOME`
+profiles or aliases—the first task to call the server
+owns an advisory OS file lock. Calls from the same logical task are re-entrant;
+another task waits only for the configured bound, then receives a retryable
+tool error. The lease is released at the task's turn boundary and by the OS if
+the process crashes. It is never stolen from a live owner based on elapsed idle
+time. This is stronger than per-RPC serialization because it protects a
+multi-call state/action/state sequence. The scope is the whole server because
+generic MCP calls do not expose a reliable app/window ownership key.
 
 ## Environment variable references
 

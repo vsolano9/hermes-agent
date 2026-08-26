@@ -16,6 +16,83 @@ model** — Claude, GPT, Gemini, or an open model on a local
 OpenAI-compatible endpoint. There's no Anthropic-native schema to worry
 about.
 
+## Optional: the local Codex Computer Use MCP
+
+On macOS, Hermes can optionally reference the Computer Use service already
+installed by the OpenAI Codex app:
+
+```text
+hermes mcp install codex-computer-use
+```
+
+This is a local compatibility adapter, not the default driver. It ships no
+OpenAI executable or asset. Before every launch it resolves the service from
+`CODEX_HOME` (default `~/.codex`) and verifies the exact signed OpenAI service
+and CLI bundle identities (Team ID `2DC432GLL2`). A missing path, changed bundle
+identity, signature, or pinned tool-schema/annotation mismatch fails closed.
+
+The catalog pins the current ten-tool surface and full initialize capabilities,
+disables parallel tool calls, and enables an OS-account/UID-global
+cross-process single-writer lock across all Hermes profiles. A crashed owner
+releases the OS lock automatically; an active owner is never displaced by an
+idle timer. The entry is `trust: untrusted`: signature verification proves
+identity, but low-level click/type arguments cannot classify business
+consequence, so write-capable calls keep Hermes approval. macOS Accessibility
+and Screen Recording must be granted to the signed OpenAI Computer Use identity
+shown by System Settings.
+
+Routine delegated calls avoid per-click prompts through a two-turn protocol.
+An observation child reads `get_app_state` and returns one proposal containing
+the app, fresh `state_digest`, tool, and exact arguments. After the parent
+reviews it as routine, an execution child receives `computer_scope.proposal`.
+The private grant is single-use and bound to that child/server/app/state/tool/
+canonical-arguments tuple with a short expiry. Any mismatch, replay, stale
+state, or second mutation returns to the untrusted approval path before
+transport. Raw click/type arguments cannot reveal semantic consequence, so the
+parent—not a claimed host classifier—must stop consequential work for user
+confirmation before creating its exact execution turn.
+
+To keep a Claude parent as orchestrator while routing only UI work to Codex:
+
+```yaml
+delegation:
+  provider: openai-codex
+  model: gpt-5.6-sol
+```
+
+The parent first calls `delegate_task` with
+`toolsets: [mcp-codex-computer-use]` and no `computer_scope` to obtain a fresh
+proposal. A second call uses `computer_scope: {proposal: {app, state_digest,
+tool, args}, ttl_seconds: 30}` only after parent review.
+That scoped execution accepts exactly one child; a batch is rejected before
+spawn admission or grant creation.
+That exact child scope excludes the
+built-in `computer_use` stack and does not involve Cursor. The workflow targets
+an already-running normal Chrome profile; it does not launch or copy an
+automation profile. Unlike the built-in driver below, this optional OpenAI
+surface has no documented background/no-focus guarantee, so an action may bring
+the target app forward.
+
+Rollback is configuration-only:
+
+```text
+hermes mcp uninstall codex-computer-use
+```
+
+OpenAI documents its [Responses API computer-use tool](https://developers.openai.com/api/docs/guides/tools-computer-use),
+but does not document third-party reuse of the Codex app's local MCP as a
+supported public interface. The Responses API is therefore a separately
+maintained API-key fallback, not the primary path described here. If a Codex
+update changes the local client, Hermes refuses to launch it until the adapter
+is reviewed.
+
+The launcher rejects symlinked/unsafe path components, verifies the outer and
+nested bundles with deep/strict code-signing requirements, then rechecks their
+device/inode and metadata identities immediately before execution. A same-user
+process with permission to rewrite the signed Codex installation still leaves
+a small verification-to-exec race because this macOS/Python path cannot execute
+a Mach-O binary by its already-verified file descriptor.
+
 ## How it works
 
 The built-in `computer_use` toolset is the recommended Hermes integration. It

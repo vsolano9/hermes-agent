@@ -99,6 +99,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import hashlib
 import inspect
 import json
 import logging
@@ -121,6 +122,146 @@ from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_mcp_surface(tools: List[Any]) -> bytes:
+    """Canonicalize the complete model-visible Tool contract for pinning."""
+
+    surface = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            raw = tool
+        elif hasattr(tool, "model_dump"):
+            raw = tool.model_dump(mode="json", by_alias=True, exclude_none=True)
+        else:
+            raw = {
+                "name": getattr(tool, "name", None),
+                "title": getattr(tool, "title", None),
+                "description": getattr(tool, "description", None),
+                "inputSchema": getattr(tool, "inputSchema", None),
+                "outputSchema": getattr(tool, "outputSchema", None),
+                "annotations": getattr(tool, "annotations", None),
+                "execution": getattr(tool, "execution", None),
+                "icons": getattr(tool, "icons", None),
+            }
+        annotations = raw.get("annotations") or {}
+        if not isinstance(annotations, dict) and hasattr(annotations, "model_dump"):
+            annotations = annotations.model_dump(
+                mode="json", by_alias=True, exclude_none=True
+            )
+        surface.append({
+            "name": raw.get("name"),
+            "title": raw.get("title"),
+            "description": raw.get("description"),
+            "inputSchema": raw.get("inputSchema") or raw.get("input_schema"),
+            "outputSchema": raw.get("outputSchema") or raw.get("output_schema"),
+            "annotations": annotations,
+            "execution": raw.get("execution"),
+            "icons": raw.get("icons"),
+        })
+    surface.sort(key=lambda item: str(item.get("name") or ""))
+    return json.dumps(
+        surface,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def _mcp_surface_sha256(tools: List[Any]) -> str:
+    return hashlib.sha256(_canonical_mcp_surface(tools)).hexdigest()
+
+
+def _capability_json_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json", by_alias=True, exclude_none=False)
+    if isinstance(value, dict):
+        return {
+            str(key): _capability_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_capability_json_value(item) for item in value]
+    if hasattr(value, "__dict__"):
+        return {
+            key: _capability_json_value(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return value
+
+
+def _canonical_mcp_capabilities(capabilities: Any) -> bytes:
+    return json.dumps(
+        _capability_json_value(capabilities),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _mcp_capabilities_sha256(capabilities: Any) -> str:
+    return hashlib.sha256(_canonical_mcp_capabilities(capabilities)).hexdigest()
+
+
+def _validate_mcp_surface(
+    server_name: str,
+    tools: List[Any],
+    capabilities: Any,
+    config: dict,
+) -> None:
+    """Refuse a pinned MCP whose initialized protocol surface drifted."""
+
+    expected = config.get("compatibility")
+    if expected is None:
+        return
+    if not isinstance(expected, dict):
+        raise ValueError(
+            f"MCP server '{server_name}' compatibility check failed: invalid policy"
+        )
+    digest = expected.get("tools_sha256")
+    capabilities_digest = expected.get("capabilities_sha256")
+    count = expected.get("tool_count")
+    if (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or not isinstance(capabilities_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", capabilities_digest)
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+    ):
+        raise ValueError(
+            f"MCP server '{server_name}' compatibility check failed: invalid policy"
+        )
+    if len(tools) != count or _mcp_surface_sha256(tools) != digest:
+        raise ValueError(
+            f"MCP server '{server_name}' compatibility check failed: "
+            "model-visible tool contract changed"
+        )
+    names = [getattr(tool, "name", None) if not isinstance(tool, dict) else tool.get("name") for tool in tools]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        raise ValueError(
+            f"MCP server '{server_name}' compatibility check failed: duplicate tool name"
+        )
+    if expected.get("tools_only") is True and capabilities is not None:
+        if (
+            getattr(capabilities, "resources", None) is not None
+            or getattr(capabilities, "prompts", None) is not None
+        ):
+            raise ValueError(
+                f"MCP server '{server_name}' compatibility check failed: "
+                "tools-only capability contract changed"
+            )
+    if (
+        capabilities is None
+        or _mcp_capabilities_sha256(capabilities) != capabilities_digest
+    ):
+        raise ValueError(
+            f"MCP server '{server_name}' compatibility check failed: "
+            "initialize capability contract changed"
+        )
 
 
 # Hard allocation ceiling for a single MCP text payload (chars). This is the
@@ -618,6 +759,7 @@ _MCP_LOOP_DRAIN_TIMEOUT = 3.0
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
+    "CODEX_HOME",
 })
 
 _SAFE_ENV_KEYS_CASE_INSENSITIVE = frozenset({
@@ -732,7 +874,7 @@ def _context_var_value(ref: str) -> Optional[str]:
 # Security helpers
 # ---------------------------------------------------------------------------
 
-def _build_safe_env(user_env: Optional[dict]) -> dict:
+def _build_safe_env(user_env: Optional[dict], *, minimal: bool = False) -> dict:
     """Build a filtered environment dict for stdio subprocesses.
 
     Only passes through safe baseline variables (PATH, HOME, etc.) and XDG_*
@@ -757,7 +899,11 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             key in _SAFE_ENV_KEYS
             or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
             or key.startswith("XDG_")
-            or (get_secret_source is not None and get_secret_source(key))
+            or (
+                not minimal
+                and get_secret_source is not None
+                and get_secret_source(key)
+            )
         ):
             env[key] = value
     if user_env:
@@ -2784,6 +2930,21 @@ class MCPServerTask:
             # notifications. Tools absent from the fresh list are no longer
             # callable, so remove only those stale registry entries first.
             toolset_name = f"mcp-{self.name}"
+            try:
+                _validate_mcp_surface(
+                    self.name,
+                    new_mcp_tools,
+                    getattr(self.initialize_result, "capabilities", None),
+                    self._config,
+                )
+            except Exception:
+                for tool_name in old_tool_names:
+                    if registry.get_toolset_for_tool(tool_name) == toolset_name:
+                        registry.deregister(tool_name)
+                        _forget_mcp_tool_server(tool_name)
+                self._registered_tool_names = []
+                self._tools = []
+                raise
             stale_tool_names = old_tool_names - {
                 mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
@@ -3194,7 +3355,9 @@ class MCPServerTask:
                 f"MCP server '{self.name}' has no 'command' in config"
             )
 
-        safe_env = _build_safe_env(user_env)
+        safe_env = _build_safe_env(
+            user_env, minimal=_parse_boolish(config.get("minimal_env"), default=False)
+        )
         command, safe_env = _resolve_stdio_command(command, safe_env)
 
         # Check package against OSV malware database before spawning.
@@ -3858,15 +4021,36 @@ class MCPServerTask:
                 "skipping tools/list (prompts/resources remain available)",
                 self.name,
             )
-            self._tools = []
-            self._register_discovered_tools_if_needed()
+            discovered_tools = []
+            self._accept_discovered_tools(discovered_tools)
             return
         async with self._rpc_lock:
             self._list_cache_meta = {}
-            self._tools = await _paginate_full_list(
+            discovered_tools = await _paginate_full_list(
                 self.session.list_tools, "tools", self.name,
                 cache_meta_out=self._list_cache_meta,
             )
+        self._accept_discovered_tools(discovered_tools)
+
+    def _accept_discovered_tools(self, discovered_tools: List[Any]) -> None:
+        """Validate a fresh live surface before it can remain published."""
+
+        try:
+            _validate_mcp_surface(
+                self.name,
+                discovered_tools,
+                getattr(self.initialize_result, "capabilities", None),
+                self._config,
+            )
+        except Exception as exc:
+            self._error = exc
+            self._ready.clear()
+            self._deregister_tools()
+            with _lock:
+                _server_connect_errors[self.name] = str(exc)
+            raise
+        self._tools = discovered_tools
+        self._error = None
         self._register_discovered_tools_if_needed()
 
     def _register_discovered_tools_if_needed(self) -> None:
@@ -3883,6 +4067,9 @@ class MCPServerTask:
         authorizes its first publication.
         """
         if self._registered_tool_names:
+            with _lock:
+                if _servers.get(self.name) is self:
+                    _server_connect_errors.pop(self.name, None)
             return
         if not self._ready.is_set():
             with _lock:
@@ -4416,6 +4603,7 @@ class MCPServerTask:
             registry.deregister(tool_name)
             _forget_mcp_tool_server(tool_name)
         self._registered_tool_names = []
+        self._tools = []
 
     async def _wait_for_lazy_reconnect(self) -> None:
         """Wait while an intentionally recycled stdio server is dormant."""
@@ -4565,6 +4753,212 @@ _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
+_mcp_routine_grants_lock = threading.Lock()
+_mcp_routine_grants: Dict[str, dict] = {}
+_mcp_state_observations: Dict[Tuple[str, str, str], dict] = {}
+
+
+def _canonical_action_arguments(arguments: Any) -> bytes:
+    """Canonicalize one proposed MCP action without accepting lossy values."""
+
+    if not isinstance(arguments, dict):
+        raise ValueError("Exact MCP action arguments must be a mapping")
+    try:
+        return json.dumps(
+            arguments,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Exact MCP action arguments are not canonical JSON") from exc
+
+
+def _record_mcp_state_observation(
+    *,
+    task_id: str,
+    server_name: str,
+    app: str,
+    state_digest: str,
+) -> None:
+    """Record the fresh state that one child actually observed."""
+
+    owner = str(task_id or "").strip()
+    server = str(server_name or "").strip()
+    normalized_app = str(app or "").strip().casefold()
+    digest = str(state_digest or "").strip().lower()
+    if not owner or not server or not normalized_app or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("Invalid MCP state observation")
+    with _mcp_routine_grants_lock:
+        _mcp_state_observations[(owner, server, normalized_app)] = {
+            "digest": digest,
+            "consumed": False,
+        }
+
+
+def _record_state_result_for_exact_grant(
+    *,
+    server_name: str,
+    tool_name: str,
+    args: Optional[dict],
+    task_id: str,
+    result: str,
+    trusted_state_digest: Optional[str] = None,
+) -> str:
+    """Expose a state digest and bind it to the observing child.
+
+    ``result`` is model-visible, untrusted text. In particular, ``MEDIA:``
+    strings in it are never interpreted as filesystem paths. Production MCP
+    dispatch supplies a digest of the raw, structured CallToolResult before
+    image blocks are rendered into random cache paths; direct callers safely
+    fall back to hashing the literal rendered payload.
+    """
+
+    if (
+        server_name not in {"codex-computer-use", "openai-codex-cua"}
+        or tool_name != "get_app_state"
+        or not str(task_id or "").strip()
+    ):
+        return result
+    app = str((args or {}).get("app") or "").strip()
+    if not app:
+        return result
+    try:
+        payload = json.loads(result)
+        if not isinstance(payload, dict) or "error" in payload:
+            return result
+        payload.pop("state_digest", None)
+        if trusted_state_digest is None:
+            state_bytes = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+            digest = hashlib.sha256(state_bytes).hexdigest()
+        else:
+            digest = str(trusted_state_digest).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                return result
+        _record_mcp_state_observation(
+            task_id=task_id,
+            server_name=server_name,
+            app=app,
+            state_digest=digest,
+        )
+        payload["state_digest"] = digest
+        return json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return result
+
+
+def _trusted_mcp_result_sha256(result: Any) -> str:
+    """Hash a host-received MCP result before rendering/cache-path creation."""
+
+    canonical = json.dumps(
+        _capability_json_value(result),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _issue_mcp_exact_action_grant(
+    *,
+    task_id: str,
+    server_name: str,
+    app: str,
+    state_digest: str,
+    tool_name: str,
+    arguments: dict,
+    ttl_seconds: float,
+    monotonic=time.monotonic,
+) -> None:
+    """Bind one private grant to one state snapshot and canonical mutation."""
+
+    owner = str(task_id or "").strip()
+    server = str(server_name or "").strip()
+    normalized_app = str(app or "").strip().casefold()
+    digest = str(state_digest or "").strip().lower()
+    tool = str(tool_name or "").strip()
+    ttl = float(ttl_seconds)
+    if (
+        not owner
+        or not server
+        or not normalized_app
+        or not tool
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or not (1 <= ttl <= 60)
+    ):
+        raise ValueError("Invalid exact MCP action grant")
+    args_hash = hashlib.sha256(_canonical_action_arguments(arguments)).hexdigest()
+    with _mcp_routine_grants_lock:
+        _mcp_routine_grants[owner] = {
+            "server": server,
+            "app": normalized_app,
+            "state_digest": digest,
+            "tool": tool,
+            "args_hash": args_hash,
+            "expires": monotonic() + ttl,
+            "consumed": False,
+        }
+
+
+def _consume_mcp_exact_action_grant(
+    server_name: str,
+    tool_name: str,
+    args: Optional[dict],
+    task_id: str,
+    *,
+    monotonic=time.monotonic,
+) -> bool:
+    owner = str(task_id or "").strip()
+    app = str((args or {}).get("app") or "").strip().casefold()
+    if not owner or not app:
+        return False
+    try:
+        args_hash = hashlib.sha256(
+            _canonical_action_arguments(args or {})
+        ).hexdigest()
+    except ValueError:
+        return False
+    with _mcp_routine_grants_lock:
+        grant = _mcp_routine_grants.get(owner)
+        observation = _mcp_state_observations.get((owner, server_name, app))
+        if (
+            not grant
+            or grant["server"] != server_name
+            or grant["app"] != app
+            or grant["tool"] != tool_name
+            or grant["args_hash"] != args_hash
+            or monotonic() >= grant["expires"]
+            or grant["consumed"]
+            or not observation
+            or observation["digest"] != grant["state_digest"]
+            or observation["consumed"]
+        ):
+            return False
+        grant["consumed"] = True
+        observation["consumed"] = True
+        return True
+
+
+def release_mcp_routine_grant(task_id: str) -> None:
+    owner = str(task_id or "").strip()
+    with _mcp_routine_grants_lock:
+        _mcp_routine_grants.pop(owner, None)
+        for key in [key for key in _mcp_state_observations if key[0] == owner]:
+            _mcp_state_observations.pop(key, None)
+
+
+def _reset_mcp_routine_grants_for_tests() -> None:
+    with _mcp_routine_grants_lock:
+        _mcp_routine_grants.clear()
+        _mcp_state_observations.clear()
 
 
 def _normalize_server_trust(value: Any) -> str:
@@ -4621,7 +5015,14 @@ def _record_tool_trust_metadata(
                 hints[name] = _annotation_read_only_hint(tool)
 
 
-def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+def _trust_gate_check(
+    server_name: str,
+    tool_name: str,
+    args: Optional[dict] = None,
+    task_id: str = "",
+    *,
+    monotonic=time.monotonic,
+) -> Optional[str]:
     """Consult the approval path for write-capable tools on untrusted servers.
 
     Returns None when the call may proceed, or an error string (already
@@ -4632,6 +5033,10 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     if trust != _TRUST_UNTRUSTED:
         return None
     if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
+        return None
+    if _consume_mcp_exact_action_grant(
+        server_name, tool_name, args, task_id, monotonic=monotonic
+    ):
         return None
 
     # Lazy import mirrors the elicitation handler's pattern: tools.approval
@@ -5200,6 +5605,199 @@ def _handle_session_expired_and_retry(
 # Raw identity matters: distinct names such as ``foo-bar`` and ``foo_bar`` both
 # sanitize to ``foo_bar`` but must not share policy.
 _parallel_safe_servers: set = set()
+
+# Stateful desktop/editor MCPs may opt into a task-scoped single-writer lease.
+# Hermes already serializes individual RPCs with MCPServerTask._rpc_lock; this
+# stronger policy prevents two agent tasks from interleaving action sequences.
+_single_writer_condition = threading.Condition(threading.Lock())
+_single_writer_policies: Dict[str, Tuple[float, float]] = {}
+_single_writer_leases: Dict[str, Tuple[str, float]] = {}
+_single_writer_process_locks: Dict[str, Tuple[str, Any]] = {}
+_single_writer_capability_keys: Dict[str, str] = {}
+
+_CODEX_CUA_TOOLS_SHA256 = (
+    "dd485a140f5fbebe14147fb3ee2ed3914618b3484964efe02262b2479b322f1d"
+)
+_CODEX_CUA_CAPABILITIES_SHA256 = (
+    "52aa21370a62916d63adb5718fa1be519ec0fe4390136bf36e701be54e5582a5"
+)
+
+
+def _single_writer_capability_key(server_name: str, config: Optional[dict] = None) -> str:
+    compatibility = (config or {}).get("compatibility")
+    if (
+        isinstance(compatibility, dict)
+        and compatibility.get("tools_sha256") == _CODEX_CUA_TOOLS_SHA256
+        and compatibility.get("capabilities_sha256")
+        == _CODEX_CUA_CAPABILITIES_SHA256
+    ):
+        return "openai-codex-cua"
+    normalized = re.sub(r"[^a-z0-9]+", "-", server_name.casefold()).strip("-")
+    if normalized in {"codex-computer-use", "openai-codex-cua"}:
+        return "openai-codex-cua"
+    return f"mcp-server:{server_name}"
+
+
+def _machine_account_home_for_lock():
+    """Return the OS account home, independent of Hermes profile aliases."""
+
+    import pwd
+    from pathlib import Path
+
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+
+
+def _try_acquire_single_writer_process_lock(server_name: str) -> Any:
+    """Acquire the OS-account/UID-global lock for one stateful server."""
+
+    try:
+        import stat
+
+        uid = os.getuid()
+        account_home = _machine_account_home_for_lock()
+        lock_root = account_home / ".hermes-machine-locks"
+        lock_dir = lock_root / "mcp-single-writer"
+        for directory in (lock_root, lock_dir):
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != uid
+                or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                raise PermissionError("unsafe machine-global MCP lock directory")
+        capability_key = _single_writer_capability_keys.get(
+            server_name, _single_writer_capability_key(server_name)
+        )
+        digest = hashlib.sha256(capability_key.encode("utf-8")).hexdigest()
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(lock_dir / f"{digest}.lock", flags, 0o600)
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != uid
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or info.st_nlink != 1
+        ):
+            os.close(fd)
+            raise PermissionError("unsafe machine-global MCP lock file")
+        handle = os.fdopen(fd, "a+b")
+        if not _acquire_lock_on_fh(handle):
+            handle.close()
+            return None
+        return _LockCookie(handle)
+    except Exception:
+        logger.error(
+            "MCP server '%s': cross-process single-writer lock unavailable; "
+            "refusing the call",
+            server_name,
+            exc_info=True,
+        )
+        return None
+
+
+def _configure_single_writer_server(
+    server_name: str,
+    *,
+    enabled: bool,
+    idle_timeout_seconds: float = 90.0,
+    wait_timeout_seconds: float = 10.0,
+    capability_key: Optional[str] = None,
+) -> None:
+    idle = max(1.0, min(float(idle_timeout_seconds), 3600.0))
+    wait = max(0.0, min(float(wait_timeout_seconds), 60.0))
+    with _single_writer_condition:
+        if enabled:
+            _single_writer_policies[server_name] = (idle, wait)
+            _single_writer_capability_keys[server_name] = (
+                capability_key or _single_writer_capability_key(server_name)
+            )
+        else:
+            _single_writer_policies.pop(server_name, None)
+            _single_writer_capability_keys.pop(server_name, None)
+            _single_writer_leases.pop(server_name, None)
+            held = _single_writer_process_locks.pop(server_name, None)
+            if held is not None:
+                held[1].release()
+        _single_writer_condition.notify_all()
+
+
+def _acquire_single_writer_lease(
+    server_name: str,
+    owner_task_id: str,
+    *,
+    wait_timeout_seconds: Optional[float] = None,
+    monotonic=time.monotonic,
+) -> bool:
+    """Acquire or refresh a bounded task lease for one MCP server."""
+
+    owner = str(owner_task_id or "").strip()
+    if not owner:
+        return server_name not in _single_writer_policies
+    with _single_writer_condition:
+        policy = _single_writer_policies.get(server_name)
+        if policy is None:
+            return True
+        _idle_timeout, configured_wait = policy
+        wait_timeout = (
+            configured_wait
+            if wait_timeout_seconds is None
+            else max(0.0, min(float(wait_timeout_seconds), 60.0))
+        )
+        deadline = monotonic() + wait_timeout
+        while True:
+            now = monotonic()
+            current = _single_writer_leases.get(server_name)
+            if current is not None and current[0] == owner:
+                _single_writer_leases[server_name] = (owner, now)
+                return True
+            if current is None:
+                cookie = _try_acquire_single_writer_process_lock(server_name)
+                if cookie is not None:
+                    _single_writer_process_locks[server_name] = (owner, cookie)
+                    _single_writer_leases[server_name] = (owner, now)
+                    return True
+            remaining = deadline - now
+            if remaining <= 0:
+                return False
+            _single_writer_condition.wait(timeout=min(remaining, 0.05))
+
+
+def release_mcp_single_writer_leases(owner_task_id: str) -> None:
+    """Release every stateful MCP lease owned by one completed agent task."""
+
+    owner = str(owner_task_id or "").strip()
+    if not owner:
+        return
+    with _single_writer_condition:
+        stale = [
+            server_name
+            for server_name, (lease_owner, _last_used) in _single_writer_leases.items()
+            if lease_owner == owner
+        ]
+        for server_name in stale:
+            _single_writer_leases.pop(server_name, None)
+            held = _single_writer_process_locks.pop(server_name, None)
+            if held is not None:
+                held[1].release()
+        if stale:
+            _single_writer_condition.notify_all()
+
+
+def _reset_single_writer_leases_for_tests() -> None:
+    with _single_writer_condition:
+        for _owner, cookie in _single_writer_process_locks.values():
+            cookie.release()
+        _single_writer_policies.clear()
+        _single_writer_capability_keys.clear()
+        _single_writer_leases.clear()
+        _single_writer_process_locks.clear()
+        _single_writer_condition.notify_all()
 
 # Exact MCP tool-name provenance. The generated registry name is lossy because
 # provider-safe normalization maps punctuation to ``_``. Keep the raw server
@@ -6041,9 +6639,21 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
         # first-use spawn below. A denied call never touches the server.
-        gate_error = _trust_gate_check(server_name, tool_name)
+        owner_task_id = str(
+            kwargs.get("task_id") or kwargs.get("session_id") or ""
+        )
+        gate_error = _trust_gate_check(
+            server_name, tool_name, args, owner_task_id
+        )
         if gate_error is not None:
             return gate_error
+
+        if not _acquire_single_writer_lease(server_name, owner_task_id):
+            return tool_error(
+                f"MCP server '{server_name}' is reserved by another agent "
+                "task. Retry after that task completes; do not interleave "
+                "stateful actions."
+            )
 
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -6104,7 +6714,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        trusted_state_digest: Dict[str, str] = {}
+
         async def _call():
+            trusted_state_digest.clear()
             _mark_server_call_started(server)
             async with server._rpc_lock, _track_inflight_rpc(
                 server, server_name, f"tools/call {tool_name}"
@@ -6204,6 +6817,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         error_text or "MCP tool returned an error"
                     )
                 ))
+
+            # Bind exact-action authorization to the trusted, structured MCP
+            # result before images are rendered as model-visible MEDIA: cache
+            # paths. Never recover a path from tool-controlled result text.
+            if (
+                server_name in {"codex-computer-use", "openai-codex-cua"}
+                and tool_name == "get_app_state"
+            ):
+                try:
+                    trusted_state_digest["value"] = _trusted_mcp_result_sha256(result)
+                except (TypeError, ValueError):
+                    # Unserializable result shapes remain safe: the outer
+                    # recorder hashes literal rendered text without file I/O.
+                    trusted_state_digest.clear()
 
             # Collect text from content blocks. MCP tool results can also
             # include ImageContent blocks (screenshot / Blockbench / Playwright
@@ -6321,6 +6948,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _bump_server_error(server_name)
                 else:
                     _reset_server_error(server_name)  # success — reset
+                    result = _record_state_result_for_exact_grant(
+                        server_name=server_name,
+                        tool_name=tool_name,
+                        args=args,
+                        task_id=owner_task_id,
+                        result=result,
+                        trusted_state_digest=trusted_state_digest.get("value"),
+                    )
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
             return result
@@ -7118,6 +7753,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    _validate_mcp_surface(
+        name,
+        server._tools,
+        getattr(getattr(server, "initialize_result", None), "capabilities", None),
+        config,
+    )
 
     # Selective tool loading: honour include/exclude lists from config.
     # Rules (matching issue #690 spec, extended with glob support):
@@ -7557,6 +8198,17 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     finally:
         _connect_server_claim.reset(claim_token)
 
+    try:
+        _validate_mcp_surface(
+            name,
+            server._tools,
+            getattr(getattr(server, "initialize_result", None), "capabilities", None),
+            config,
+        )
+    except Exception:
+        await server.shutdown()
+        raise
+
     with _lock:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
@@ -7641,6 +8293,47 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 _parallel_safe_servers.add(srv_name)
             else:
                 _parallel_safe_servers.discard(srv_name)
+            single_writer_raw = srv_cfg.get("single_writer", False)
+            if isinstance(single_writer_raw, dict):
+                single_writer_enabled = _parse_boolish(
+                    single_writer_raw.get("enabled", True), default=True
+                )
+                idle_timeout = single_writer_raw.get("idle_timeout_seconds", 90)
+                wait_timeout = single_writer_raw.get("wait_timeout_seconds", 10)
+            else:
+                if not isinstance(single_writer_raw, bool):
+                    logger.error(
+                        "MCP server '%s': invalid single_writer scalar; "
+                        "expected boolean or mapping and refusing registration",
+                        srv_name,
+                    )
+                    _server_connect_errors[srv_name] = (
+                        "invalid single_writer configuration"
+                    )
+                    new_servers.pop(srv_name, None)
+                    _server_connecting.discard(srv_name)
+                    continue
+                single_writer_enabled = _parse_boolish(
+                    single_writer_raw, default=False
+                )
+                idle_timeout = 90
+                wait_timeout = 10
+            try:
+                _configure_single_writer_server(
+                    srv_name,
+                    enabled=single_writer_enabled,
+                    idle_timeout_seconds=float(idle_timeout),
+                    wait_timeout_seconds=float(wait_timeout),
+                    capability_key=_single_writer_capability_key(srv_name, srv_cfg),
+                )
+            except (TypeError, ValueError):
+                logger.error(
+                    "MCP server '%s': invalid single_writer configuration; "
+                    "refusing new registration and preserving any active lease",
+                    srv_name,
+                )
+                new_servers.pop(srv_name, None)
+                _server_connecting.discard(srv_name)
 
     for srv in stale_cached:
         _signal_reconnect(srv)
@@ -7663,6 +8356,11 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         get_cached_entry = None  # type: ignore[assignment]
     if config_fingerprint is not None and get_cached_entry is not None:
         for name, cfg in new_servers.items():
+            if cfg.get("compatibility") is not None:
+                # Pinned surfaces must always be validated live before any
+                # tool is published; a user-writable schema cache is not an
+                # authority for this boundary.
+                continue
             if not _resolve_server_lazy(name, cfg):
                 continue
             entry = get_cached_entry(name, config_fingerprint(cfg))
@@ -8279,6 +8977,15 @@ def shutdown_mcp_servers():
     """
     with _lock:
         servers_snapshot = list(_servers.values())
+
+    with _single_writer_condition:
+        for _owner, cookie in _single_writer_process_locks.values():
+            cookie.release()
+        _single_writer_policies.clear()
+        _single_writer_capability_keys.clear()
+        _single_writer_leases.clear()
+        _single_writer_process_locks.clear()
+        _single_writer_condition.notify_all()
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded

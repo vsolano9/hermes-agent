@@ -92,6 +92,26 @@ class TestLazyMcpRegistration:
 
         mock_run.assert_called_once()
 
+    def test_pinned_compatibility_never_publishes_user_writable_cache(self):
+        config = _lazy_config()
+        config["playwright"]["compatibility"] = {
+            "tools_sha256": "0" * 64,
+            "tool_count": 1,
+            "tools_only": True,
+        }
+        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_schema_cache.config_fingerprint", return_value="abc"), \
+             patch("tools.mcp_schema_cache.get_cached_entry", return_value=_fake_cache_entry()) as mock_get, \
+             patch("tools.mcp_tool._register_from_cache_sync") as mock_register, \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
+
+            mcp.register_mcp_servers(config)
+
+        mock_get.assert_not_called()
+        mock_register.assert_not_called()
+        mock_run.assert_called_once()
+
     def test_non_lazy_server_never_touches_cache(self):
         config = {"playwright": {"command": "npx", "args": []}}
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \

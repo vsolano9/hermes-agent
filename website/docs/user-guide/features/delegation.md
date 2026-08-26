@@ -225,9 +225,23 @@ Credentials resolve exactly like a `delegation.provider` pin (full runtime-provi
 
 `/review` is deliberately separate from `/refine`: `/refine` reviews the conversation to update memory and skills, `/review` reviews the *work product* the conversation created.
 
-## Inherited Tool Access
+## Inherited and exact tool access
 
-`delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.
+By default, each subagent inherits the parent's enabled toolsets. A delegation
+may instead pass `toolsets` to give every child in that call an **exact subset**
+of the parent's enabled toolsets:
+
+```python
+delegate_task(
+    goal="Inspect the signed desktop surface",
+    toolsets=["mcp-codex-computer-use"]
+)
+```
+
+The list must be non-empty, contain unique toolset names, and can only narrow
+authority. A name that the parent does not own fails before any child starts.
+Exact-scoped children do not regain delegation or inherit other MCP toolsets,
+which is useful when two integrations expose overlapping capabilities.
 
 Certain tools are blocked for subagents even when the parent has them:
 - `delegate_task` — blocked for leaf subagents (the default). Retained for `role="orchestrator"` children, bounded by `max_spawn_depth` — see [Depth Limit and Nested Orchestration](#depth-limit-and-nested-orchestration) below.
@@ -435,7 +449,7 @@ For **durable execution** that must survive session closure or process restart, 
 ## Key Properties
 
 - Each subagent gets its **own terminal session** (separate from the parent)
-- Subagents inherit the parent's enabled toolsets; the model cannot select or widen them per call
+- Subagents inherit the parent's enabled toolsets by default; `toolsets` may select an exact parent-owned subset but can never widen authority
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Orchestrator subagents retain `delegate_task` but keep the other blocks. Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work instead of burning reasoning iterations.
 - **Cancellation follows ownership** — `/stop` or closing/resetting the owning session cancels its background children; synchronous descendants under orchestrators follow their parent's interrupt state

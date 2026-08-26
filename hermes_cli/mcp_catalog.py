@@ -51,6 +51,7 @@ _MANIFEST_VERSION = 1
 
 # Substituted at install time inside `transport.command` / `transport.args`.
 _INSTALL_DIR_VAR = "${INSTALL_DIR}"
+_CATALOG_ENTRY_DIR_VAR = "${CATALOG_ENTRY_DIR}"
 
 
 # ─── Data classes ────────────────────────────────────────────────────────────
@@ -86,6 +87,9 @@ class TransportSpec:
     # opt-outs, mode flags). NOT for secrets — credentials go through
     # auth.env so they are prompted for and land in ~/.hermes/.env.
     env: Dict[str, str] = field(default_factory=dict)
+    supports_parallel_tool_calls: bool = False
+    single_writer: bool = False
+    minimal_env: bool = False
 
 
 @dataclass
@@ -120,6 +124,9 @@ class ToolsSpec:
     # list would be thousands of lines and freeze out new endpoints.
     # Mutually exclusive with ``default_enabled``.
     default_excluded: Optional[List[str]] = None
+    # Exact safety boundary: always persist this include list, without a
+    # discovery checklist that could widen to future server tools.
+    fixed_enabled: Optional[List[str]] = None
 
 
 @dataclass
@@ -155,6 +162,8 @@ class CatalogEntry:
     install: Optional[InstallSpec] = None
     post_install: str = ""
     suggest: Optional[SuggestSpec] = None
+    trust: Optional[str] = None
+    compatibility: Optional[dict] = None
     manifest_path: Path = field(default_factory=Path)
 
 
@@ -231,6 +240,17 @@ def _parse_manifest(path: Path) -> CatalogEntry:
         raise CatalogError(
             f"{path}: transport.env must be a mapping of string to string"
         )
+    parallel_flag = transport_raw.get("supports_parallel_tool_calls", False)
+    single_writer_flag = transport_raw.get("single_writer", False)
+    minimal_env_flag = transport_raw.get("minimal_env", False)
+    if not isinstance(parallel_flag, bool):
+        raise CatalogError(
+            f"{path}: transport.supports_parallel_tool_calls must be boolean"
+        )
+    if not isinstance(single_writer_flag, bool):
+        raise CatalogError(f"{path}: transport.single_writer must be boolean")
+    if not isinstance(minimal_env_flag, bool):
+        raise CatalogError(f"{path}: transport.minimal_env must be boolean")
     transport = TransportSpec(
         type=t_type,
         command=transport_raw.get("command"),
@@ -238,6 +258,9 @@ def _parse_manifest(path: Path) -> CatalogEntry:
         url=transport_raw.get("url"),
         version=transport_raw.get("version"),
         env=dict(env_raw),
+        supports_parallel_tool_calls=parallel_flag,
+        single_writer=single_writer_flag,
+        minimal_env=minimal_env_flag,
     )
     if t_type == "stdio" and not transport.command:
         raise CatalogError(f"{path}: stdio transport requires 'command'")
@@ -296,14 +319,58 @@ def _parse_manifest(path: Path) -> CatalogEntry:
             raise CatalogError(
                 f"{path}: tools.default_excluded must be a list of strings"
             )
-    if default_enabled is not None and default_excluded is not None:
+    fixed_enabled = tools_raw.get("fixed_enabled")
+    if fixed_enabled is not None:
+        if not isinstance(fixed_enabled, list) or not all(
+            isinstance(t, str) and t for t in fixed_enabled
+        ):
+            raise CatalogError(
+                f"{path}: tools.fixed_enabled must be a list of non-empty strings"
+            )
+    configured_tool_modes = sum(
+        value is not None
+        for value in (default_enabled, default_excluded, fixed_enabled)
+    )
+    if configured_tool_modes > 1:
         raise CatalogError(
-            f"{path}: tools.default_enabled and tools.default_excluded are "
-            "mutually exclusive"
+            f"{path}: tools.default_enabled, tools.default_excluded, and "
+            "tools.fixed_enabled are mutually exclusive"
         )
     tools_spec = ToolsSpec(
-        default_enabled=default_enabled, default_excluded=default_excluded
+        default_enabled=default_enabled,
+        default_excluded=default_excluded,
+        fixed_enabled=fixed_enabled,
     )
+
+    trust = data.get("trust")
+    if trust is not None and trust not in {"full", "untrusted"}:
+        raise CatalogError(f"{path}: trust must be 'full' or 'untrusted'")
+
+    compatibility = data.get("compatibility")
+    if compatibility is not None:
+        if not isinstance(compatibility, dict):
+            raise CatalogError(f"{path}: compatibility must be a mapping")
+        digest = compatibility.get("tools_sha256")
+        capabilities_digest = compatibility.get("capabilities_sha256")
+        count = compatibility.get("tool_count")
+        tools_only = compatibility.get("tools_only")
+        if (
+            not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(capabilities_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", capabilities_digest)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+            or not isinstance(tools_only, bool)
+        ):
+            raise CatalogError(f"{path}: invalid compatibility contract")
+        compatibility = {
+            "tools_sha256": digest,
+            "capabilities_sha256": capabilities_digest,
+            "tool_count": count,
+            "tools_only": tools_only,
+        }
 
     suggest: Optional[SuggestSpec] = None
     suggest_raw = data.get("suggest")
@@ -367,6 +434,8 @@ def _parse_manifest(path: Path) -> CatalogEntry:
         install=install,
         post_install=str(data.get("post_install") or ""),
         suggest=suggest,
+        trust=trust,
+        compatibility=compatibility,
         manifest_path=path,
     )
 
@@ -557,6 +626,14 @@ def _expand_install_dir(value: str, install_dir: Optional[Path]) -> str:
     return value.replace(_INSTALL_DIR_VAR, str(install_dir))
 
 
+def _expand_catalog_entry_dir(value: str, entry: CatalogEntry) -> str:
+    if _CATALOG_ENTRY_DIR_VAR not in value:
+        return value
+    return value.replace(
+        _CATALOG_ENTRY_DIR_VAR, str(entry.manifest_path.parent.resolve())
+    )
+
+
 def _prompt_env_vars(specs: List[EnvVarSpec]) -> Dict[str, str]:
     """Walk the env spec list, prompting the user for each. Writes secrets and
     non-secrets alike to ~/.hermes/.env via save_env_value()."""
@@ -589,9 +666,13 @@ def _build_server_config(
     cfg: dict = {}
     t = entry.transport
     if t.type == "stdio":
-        cfg["command"] = _expand_install_dir(t.command or "", install_dir)
+        command = _expand_install_dir(t.command or "", install_dir)
+        cfg["command"] = _expand_catalog_entry_dir(command, entry)
         if t.args:
-            cfg["args"] = [_expand_install_dir(a, install_dir) for a in t.args]
+            cfg["args"] = [
+                _expand_catalog_entry_dir(_expand_install_dir(a, install_dir), entry)
+                for a in t.args
+            ]
         if t.env:
             cfg["env"] = dict(t.env)
     elif t.type == "http":
@@ -602,6 +683,29 @@ def _build_server_config(
             from hermes_cli.mcp_config import _bearer_auth_headers
 
             cfg["headers"] = _bearer_auth_headers(entry.name)
+    if entry.trust is not None:
+        cfg["trust"] = entry.trust
+    if t.supports_parallel_tool_calls:
+        cfg["supports_parallel_tool_calls"] = True
+    elif t.single_writer:
+        # Explicit false documents the action-serialization boundary in the
+        # installed config instead of relying on a runtime default.
+        cfg["supports_parallel_tool_calls"] = False
+    if t.single_writer:
+        cfg["single_writer"] = True
+    if t.minimal_env:
+        cfg["minimal_env"] = True
+    if entry.compatibility is not None:
+        cfg["compatibility"] = dict(entry.compatibility)
+    if entry.tools.fixed_enabled is not None:
+        # Persist the closed tool surface in the same first config write as
+        # the transport. A crash between install phases must never expose all
+        # tools from a fixed-policy server.
+        cfg["tools"] = {
+            "include": list(entry.tools.fixed_enabled),
+            "resources": False,
+            "prompts": False,
+        }
     return cfg
 
 
@@ -702,6 +806,22 @@ def _write_tools_exclude(name: str, exclude: List[str]) -> None:
     save_config(cfg)
 
 
+def _write_fixed_tools_policy(name: str, include: List[str]) -> None:
+    """Persist an exact native-tool surface with no utility wrappers."""
+
+    cfg = load_config()
+    servers = cfg.setdefault("mcp_servers", {})
+    server_entry = servers.get(name) or {}
+    server_entry["tools"] = {
+        "include": list(include),
+        "resources": False,
+        "prompts": False,
+    }
+    servers[name] = server_entry
+    cfg["mcp_servers"] = servers
+    save_config(cfg)
+
+
 def _apply_tool_selection(
     entry: CatalogEntry,
     *,
@@ -725,6 +845,15 @@ def _apply_tool_selection(
       - Either way, point the user at ``hermes mcp configure <name>``.
     """
     print()
+
+    if entry.tools.fixed_enabled is not None:
+        fixed = list(entry.tools.fixed_enabled)
+        _write_fixed_tools_policy(entry.name, fixed)
+        print(color(
+            f"  Applied fixed safety allowlist ({len(fixed)} tools).",
+            Colors.GREEN,
+        ))
+        return
 
     # Exclude-mode manifests short-circuit the checklist entirely: the curated
     # exclude list (names or glob patterns) is written as-is, everything else

@@ -1,0 +1,51 @@
+# Local compatibility adapter. It ships no OpenAI executable or asset.
+manifest_version: 1
+
+name: codex-computer-use
+description: Use the signed local OpenAI Computer Use service on macOS.
+source: https://developers.openai.com/api/docs/guides/tools-computer-use
+
+transport:
+  type: stdio
+  command: ${CATALOG_ENTRY_DIR}/launcher.py
+  supports_parallel_tool_calls: false
+  single_writer: true
+  minimal_env: true
+
+auth:
+  type: none
+
+# The installed OpenAI service currently exposes exactly these ten tools. Pin
+# the surface so an update cannot silently add a new model-visible capability.
+tools:
+  fixed_enabled:
+    - list_apps
+    - get_app_state
+    - click
+    - perform_secondary_action
+    - set_value
+    - select_text
+    - scroll
+    - drag
+    - press_key
+    - type_text
+
+# Low-level click/type tools cannot reliably infer business consequence from
+# their arguments. Keep write tools on Hermes' approval boundary; read-only
+# list/state tools use the server's pinned readOnlyHint annotations.
+trust: untrusted
+
+# Canonical SHA-256 over the full model-visible tools/list contracts and the
+# complete initialize capabilities object. Registration and reconnect fail
+# closed if the installed proprietary service changes either protocol surface.
+compatibility:
+  tools_sha256: dd485a140f5fbebe14147fb3ee2ed3914618b3484964efe02262b2479b322f1d
+  capabilities_sha256: 52aa21370a62916d63adb5718fa1be519ec0fe4390136bf36e701be54e5582a5
+  tool_count: 10
+  tools_only: true
+
+post_install: |
+  Local-only: this entry references the OpenAI service already installed by
+  Codex under CODEX_HOME (default: ~/.codex). It does not download or copy it.
+  Grant macOS Accessibility and Screen Recording to the signed OpenAI Computer
+  Use service when macOS asks. Start a new Hermes session after installation.

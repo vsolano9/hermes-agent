@@ -1272,6 +1272,26 @@ class TestBuildSafeEnv:
         assert result["NOTION_TOKEN"] == "from-op"
         assert "UNTRACKED_SECRET_KEY" not in result
 
+    def test_minimal_env_excludes_secret_sources_but_keeps_explicit_codex_home(
+        self, monkeypatch
+    ):
+        from hermes_cli import env_loader
+        from tools.mcp_tool import _build_safe_env
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "SECRET_CANARY", "bitwarden")
+        with patch.dict(
+            "os.environ",
+            {"PATH": "/usr/bin", "HOME": "/home/test", "SECRET_CANARY": "nope"},
+            clear=True,
+        ):
+            result = _build_safe_env(
+                {"CODEX_HOME": "/portable/codex"}, minimal=True
+            )
+
+        assert result["CODEX_HOME"] == "/portable/codex"
+        assert result["PATH"] == "/usr/bin"
+        assert "SECRET_CANARY" not in result
+
     def test_windows_location_vars_passed_without_secrets(self):
         """Windows launcher tools need location vars, but secrets stay filtered."""
         from tools.mcp_tool import _build_safe_env

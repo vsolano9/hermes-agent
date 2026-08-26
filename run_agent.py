@@ -8390,6 +8390,8 @@ class AIAgent:
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
+            toolsets=function_args.get("toolsets"),
+            computer_scope=function_args.get("computer_scope"),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
@@ -8968,6 +8970,18 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    try:
+                        from tools.mcp_tool import release_mcp_single_writer_leases
+
+                        release_mcp_single_writer_leases(effective_task_id)
+                        from tools.mcp_tool import release_mcp_routine_grant
+
+                        release_mcp_routine_grant(effective_task_id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to release MCP single-writer leases for task",
+                            exc_info=True,
+                        )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
