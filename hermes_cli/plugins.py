@@ -44,8 +44,10 @@ import logging
 import os
 import queue
 import re
+import stat
 import sys
 import threading
+import time
 import types
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -123,6 +125,10 @@ _PLUGINS_DEBUG = os.getenv("HERMES_PLUGINS_DEBUG", "").strip().lower() in {
     "1", "true", "yes", "on",
 }
 _DEBUG_HANDLER_INSTALLED = False
+_PLUGIN_REGISTRATION_LOCK_TIMEOUT_SECONDS = 30.0
+_PLUGIN_REGISTRATION_LOCKS_GUARD = threading.Condition(threading.RLock())
+_PLUGIN_REGISTRATION_LOCKS: dict[str, dict[str, Any]] = {}
+_PLUGIN_REGISTRATION_LOCKS_PID = os.getpid()
 
 
 def _install_plugin_debug_handler(force: bool = False) -> None:
@@ -1323,6 +1329,291 @@ def _locked_plugin_state(path: Path):
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _validate_plugin_lock_directory(path: Path, *, exact_private: bool) -> os.stat_result:
+    """Validate one host lock-directory component without following symlinks."""
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError("Plugin registration lock directory is unavailable.") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError("Plugin registration lock directory is invalid.")
+    if os.name != "nt" and hasattr(os, "getuid") and metadata.st_uid not in {0, os.getuid()}:
+        raise RuntimeError("Plugin registration lock directory owner is invalid.")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if exact_private and os.name != "nt":
+        if mode != 0o700:
+            raise RuntimeError("Plugin registration lock directory mode is invalid.")
+    elif os.name != "nt" and mode & 0o022:
+        raise RuntimeError("Hermes profile directory is group/world writable.")
+    return metadata
+
+
+def _plugin_registration_lock_directory() -> Path:
+    """Return a canonical, host-owned directory outside plugin-owned data."""
+    raw_home = Path(get_hermes_home()).absolute()
+    home_metadata = _validate_plugin_lock_directory(raw_home, exact_private=False)
+    if stat.S_ISLNK(home_metadata.st_mode):  # defensive; validator already rejects it
+        raise RuntimeError("Hermes profile directory cannot be a symlink.")
+    home = raw_home.resolve(strict=True)
+    current = home
+    for component in (".locks", "plugin-registration"):
+        current = current / component
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise RuntimeError("Plugin registration lock directory is unavailable.") from exc
+        metadata = _validate_plugin_lock_directory(current, exact_private=True)
+        if os.name != "nt" and hasattr(os, "chmod"):
+            # Newly created directories are already 0700 even under umask 000;
+            # make the invariant explicit before another process uses them.
+            os.chmod(current, 0o700, follow_symlinks=False)
+            metadata = _validate_plugin_lock_directory(current, exact_private=True)
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise RuntimeError("Plugin registration lock directory mode is invalid.")
+    return current.resolve(strict=True)
+
+
+def _validate_plugin_lock_fd(
+    fd: int, *, require_private_mode: bool = True
+) -> os.stat_result:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise RuntimeError("Plugin registration lock file is invalid.")
+    if os.name != "nt" and hasattr(os, "getuid") and metadata.st_uid not in {0, os.getuid()}:
+        raise RuntimeError("Plugin registration lock file owner is invalid.")
+    if (
+        require_private_mode
+        and os.name != "nt"
+        and stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise RuntimeError("Plugin registration lock file mode is invalid.")
+    return metadata
+
+
+def _open_plugin_registration_lock(path: Path) -> int:
+    """Open and validate one lock inode without following a planted symlink."""
+    flags = os.O_CREAT | os.O_RDWR
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    directory_fd: int | None = None
+    try:
+        if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        else:  # pragma: no cover - exercised through the Windows abstraction test
+            fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise RuntimeError("Plugin registration lock file is unavailable.") from exc
+    try:
+        if os.name != "nt":
+            _validate_plugin_lock_fd(fd, require_private_mode=False)
+            os.fchmod(fd, 0o600)
+        metadata = _validate_plugin_lock_fd(fd)
+        try:
+            path_metadata = (
+                os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+                if directory_fd is not None
+                else os.lstat(path)
+            )
+        except OSError as exc:
+            raise RuntimeError("Plugin registration lock file changed during open.") from exc
+        if (metadata.st_dev, metadata.st_ino) != (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+        ):
+            raise RuntimeError("Plugin registration lock file changed during open.")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _acquire_plugin_registration_fd(
+    fd: int, timeout_seconds: float, *, platform_name: str | None = None
+) -> None:
+    platform_name = os.name if platform_name is None else platform_name
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    if platform_name == "nt":  # pragma: no cover - hermetic branch test covers it
+        import msvcrt
+
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        while True:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out acquiring plugin registration lock.") from None
+                time.sleep(0.05)
+    else:
+        import fcntl
+
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out acquiring plugin registration lock.") from None
+                time.sleep(0.05)
+
+
+def _release_plugin_registration_fd(
+    fd: int, *, platform_name: str | None = None
+) -> None:
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name == "nt":  # pragma: no cover - hermetic branch test covers it
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _release_plugin_registration_depth(
+    canonical_key: str, owner: tuple[int, int]
+) -> None:
+    """Drop one logical owner depth and unlock only when it reaches zero."""
+    with _PLUGIN_REGISTRATION_LOCKS_GUARD:
+        entry = _PLUGIN_REGISTRATION_LOCKS.get(canonical_key)
+        if entry is None or entry["owner"] != owner or entry["depth"] <= 0:
+            raise RuntimeError("Plugin registration lock ownership changed.")
+        entry["depth"] -= 1
+        if entry["depth"] > 0:
+            return
+        fd = entry.get("fd")
+        if fd is None:
+            raise RuntimeError("Plugin registration lock ownership changed.")
+
+    release_error: BaseException | None = None
+    try:
+        _release_plugin_registration_fd(fd)
+    except BaseException as exc:  # preserve cleanup while surfacing lock failure
+        release_error = exc
+    finally:
+        try:
+            os.close(fd)
+        finally:
+            with _PLUGIN_REGISTRATION_LOCKS_GUARD:
+                entry = _PLUGIN_REGISTRATION_LOCKS.get(canonical_key)
+                if (
+                    entry is not None
+                    and entry["owner"] == owner
+                    and entry["depth"] == 0
+                ):
+                    _PLUGIN_REGISTRATION_LOCKS.pop(canonical_key, None)
+                _PLUGIN_REGISTRATION_LOCKS_GUARD.notify_all()
+    if release_error is not None:
+        raise release_error
+
+
+@contextmanager
+def _locked_plugin_registration(state: "PluginState"):
+    """Serialize one plugin's ``register`` call across Hermes processes.
+
+    AgentGrid launches four Hermes panes beside the gateway. A manager-local
+    discovery lock cannot protect a plugin-owned database namespace when those
+    five processes initialize together. Keep this host lock outside the
+    plugin-owned directory so a plugin may enforce stricter modes on its own
+    files without making the lock unreachable.
+
+    The host lock is profile- and plugin-scoped, crash-safe, bounded, and
+    reentrant for nested registration in the same process/thread.
+    """
+    global _PLUGIN_REGISTRATION_LOCKS_PID
+    lock_path = _plugin_registration_lock_directory() / f"{state._data_namespace}.lock"
+    canonical_key = str(lock_path)
+    owner = (os.getpid(), threading.get_ident())
+    deadline = time.monotonic() + _PLUGIN_REGISTRATION_LOCK_TIMEOUT_SECONDS
+    reentrant = False
+
+    with _PLUGIN_REGISTRATION_LOCKS_GUARD:
+        if _PLUGIN_REGISTRATION_LOCKS_PID != os.getpid():
+            _PLUGIN_REGISTRATION_LOCKS.clear()
+            _PLUGIN_REGISTRATION_LOCKS_PID = os.getpid()
+        while canonical_key in _PLUGIN_REGISTRATION_LOCKS:
+            entry = _PLUGIN_REGISTRATION_LOCKS[canonical_key]
+            if entry["owner"] == owner and entry.get("fd") is not None:
+                entry["depth"] += 1
+                reentrant = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out acquiring plugin registration lock.")
+            _PLUGIN_REGISTRATION_LOCKS_GUARD.wait(timeout=min(0.05, remaining))
+        if not reentrant:
+            _PLUGIN_REGISTRATION_LOCKS[canonical_key] = {
+                "owner": owner,
+                "depth": 0,
+                "fd": None,
+            }
+
+    if reentrant:
+        try:
+            yield
+        finally:
+            _release_plugin_registration_depth(canonical_key, owner)
+        return
+
+    fd: int | None = None
+    acquired = False
+    published = False
+    try:
+        fd = _open_plugin_registration_lock(lock_path)
+        _acquire_plugin_registration_fd(
+            fd,
+            max(0.0, deadline - time.monotonic()),
+        )
+        acquired = True
+        with _PLUGIN_REGISTRATION_LOCKS_GUARD:
+            entry = _PLUGIN_REGISTRATION_LOCKS.get(canonical_key)
+            if entry is None or entry["owner"] != owner:
+                raise RuntimeError("Plugin registration lock ownership changed.")
+            entry["fd"] = fd
+            entry["depth"] = 1
+            published = True
+        yield
+    finally:
+        if published:
+            _release_plugin_registration_depth(canonical_key, owner)
+        else:
+            release_error: BaseException | None = None
+            if fd is not None:
+                try:
+                    if acquired:
+                        _release_plugin_registration_fd(fd)
+                except BaseException as exc:
+                    release_error = exc
+                finally:
+                    os.close(fd)
+            with _PLUGIN_REGISTRATION_LOCKS_GUARD:
+                entry = _PLUGIN_REGISTRATION_LOCKS.get(canonical_key)
+                if entry is not None and entry["owner"] == owner:
+                    _PLUGIN_REGISTRATION_LOCKS.pop(canonical_key, None)
+                _PLUGIN_REGISTRATION_LOCKS_GUARD.notify_all()
+            if release_error is not None:
+                raise release_error
 
 
 class PluginState:
@@ -5145,7 +5436,8 @@ class PluginManager:
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
                 ctx = PluginContext(manifest, self)
-                register_fn(ctx)
+                with _locked_plugin_registration(ctx.state):
+                    register_fn(ctx)
                 registrations = [
                     registration
                     for registration in self._registration_order[registration_start:]
