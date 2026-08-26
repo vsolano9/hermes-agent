@@ -5,9 +5,11 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from hermes_cli.auth import AuthError
+from hermes_cli.model_switch import ModelSwitchResult
 
 
 _OPUS = "claude-opus-5"
@@ -20,6 +22,82 @@ _DESIRED_CHAIN = [
     {"provider": "xai-oauth", "model": "grok-4.6"},
     {"provider": "openai-codex", "model": "gpt-5.6-sol"},
 ]
+_SELECTED_REASONING = {"enabled": True, "effort": "medium"}
+
+
+class _SwitchAgent:
+    _config_context_length = None
+    _custom_providers = None
+
+    def __init__(self, *, fail: bool = False):
+        self.fail = fail
+        self.before_failure = None
+        self.reasoning_config = {"enabled": True, "effort": "low"}
+        self.calls = []
+
+    def switch_model(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail:
+            if self.before_failure is not None:
+                self.before_failure()
+            raise RuntimeError("selected transport failed")
+        self.reasoning_config = copy.deepcopy(_SELECTED_REASONING)
+
+
+def _startup_fallback_switch_shell(*, fail: bool = False):
+    return SimpleNamespace(
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        requested_provider="openai-codex",
+        reasoning_config={"enabled": True, "effort": "low"},
+        _configured_primary_runtime={
+            "model": _OPUS,
+            "provider": _ANTHROPIC,
+            "reasoning_config": {"enabled": True, "effort": "high"},
+        },
+        _startup_auth_fallback_active=True,
+        _explicit_api_key="codex-test-key",
+        _explicit_base_url="https://chatgpt.com/backend-api/codex",
+        api_key="codex-test-key",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_mode="codex_responses",
+        agent=_SwitchAgent(fail=fail),
+        conversation_history=[],
+        _pending_model_switch_note=None,
+        _pending_one_turn_model_restore=None,
+        _session_db=None,
+        session_id=None,
+        _confirm_expensive_model_switch=lambda _result: True,
+    )
+
+
+def _selected_result():
+    return ModelSwitchResult(
+        success=True,
+        new_model="claude-sonnet-4.6",
+        target_provider="anthropic",
+        api_key="anthropic-selected-key",
+        base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages",
+        provider_label="Anthropic",
+    )
+
+
+def _patch_switch_display(monkeypatch):
+    import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_cprint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_module, "save_config_value", lambda *_args: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cli_module.HermesCLI,
+        "_clear_persisted_context_for_model_switch",
+        lambda *_args, **_kwargs: None,
+    )
+    return cli_module
 
 
 def _make_shell(monkeypatch, tmp_path, *, chain):
@@ -201,3 +279,105 @@ def test_nonrestorable_startup_primary_is_not_mixed_with_fallback_transport():
     assert agent.model == "gpt-5.6-sol"
     assert agent.provider == "openai-codex"
     assert agent._fallback_index == 2
+
+
+def test_picker_switch_replaces_startup_primary_and_clears_latch(monkeypatch):
+    cli_module = _patch_switch_display(monkeypatch)
+    shell = _startup_fallback_switch_shell()
+
+    cli_module.HermesCLI._apply_model_switch_result(
+        shell, _selected_result(), persist_global=False,
+    )
+
+    assert shell.reasoning_config == _SELECTED_REASONING
+    assert shell._configured_primary_runtime == {
+        "model": "claude-sonnet-4.6",
+        "provider": "anthropic",
+        "reasoning_config": _SELECTED_REASONING,
+    }
+    assert shell._startup_auth_fallback_active is False
+
+
+@pytest.mark.parametrize("persist_global", [False, True], ids=["session", "global"])
+def test_typed_switch_replaces_startup_primary_for_session_and_global(
+    monkeypatch, persist_global
+):
+    cli_module = _patch_switch_display(monkeypatch)
+    shell = _startup_fallback_switch_shell()
+
+    cli_module.HermesCLI._confirm_and_apply_cli_model_switch(
+        shell,
+        _selected_result(),
+        persist_global=persist_global,
+        one_turn=False,
+    )
+
+    assert shell.reasoning_config == _SELECTED_REASONING
+    assert shell._configured_primary_runtime == {
+        "model": "claude-sonnet-4.6",
+        "provider": "anthropic",
+        "reasoning_config": _SELECTED_REASONING,
+    }
+    assert shell._startup_auth_fallback_active is False
+
+
+def test_typed_once_preserves_configured_primary_and_startup_latch(monkeypatch):
+    cli_module = _patch_switch_display(monkeypatch)
+    shell = _startup_fallback_switch_shell()
+    configured_before = copy.deepcopy(shell._configured_primary_runtime)
+    shell._snapshot_model_runtime = (
+        cli_module.HermesCLI._snapshot_model_runtime.__get__(shell)
+    )
+
+    cli_module.HermesCLI._confirm_and_apply_cli_model_switch(
+        shell, _selected_result(), persist_global=False, one_turn=True,
+    )
+
+    assert shell._configured_primary_runtime == configured_before
+    assert shell._startup_auth_fallback_active is True
+    assert shell._pending_one_turn_model_restore["reasoning_config"] == {
+        "enabled": True,
+        "effort": "low",
+    }
+    assert (
+        shell._pending_one_turn_model_restore["_configured_primary_runtime"]
+        == configured_before
+    )
+    assert (
+        shell._pending_one_turn_model_restore["_startup_auth_fallback_active"]
+        is True
+    )
+
+
+@pytest.mark.parametrize("switch_path", ["picker", "typed"])
+def test_failed_switch_restores_primary_snapshot_and_latch(
+    monkeypatch, switch_path
+):
+    cli_module = _patch_switch_display(monkeypatch)
+    shell = _startup_fallback_switch_shell(fail=True)
+    configured_before = copy.deepcopy(shell._configured_primary_runtime)
+    reasoning_before = copy.deepcopy(shell.reasoning_config)
+
+    def _simulate_partial_switch_state():
+        shell.reasoning_config = copy.deepcopy(_SELECTED_REASONING)
+        shell._configured_primary_runtime = {
+            "model": "partially-committed-model",
+            "provider": "partially-committed-provider",
+            "reasoning_config": copy.deepcopy(_SELECTED_REASONING),
+        }
+        shell._startup_auth_fallback_active = False
+
+    shell.agent.before_failure = _simulate_partial_switch_state
+
+    if switch_path == "picker":
+        cli_module.HermesCLI._apply_model_switch_result(
+            shell, _selected_result(), persist_global=False,
+        )
+    else:
+        cli_module.HermesCLI._confirm_and_apply_cli_model_switch(
+            shell, _selected_result(), persist_global=False, one_turn=False,
+        )
+
+    assert shell.reasoning_config == reasoning_before
+    assert shell._configured_primary_runtime == configured_before
+    assert shell._startup_auth_fallback_active is True

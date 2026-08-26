@@ -30,7 +30,14 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm.example.com/v1"):
+def _make_agent(
+    fallback_model=None,
+    provider="custom",
+    base_url="https://my-llm.example.com/v1",
+    *,
+    model="",
+    api_mode="chat_completions",
+):
     """Create a minimal AIAgent with optional fallback config."""
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
@@ -47,9 +54,11 @@ def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm
         ),
     ):
         agent = AIAgent(
+            model=model,
             api_key="test-key-12345678",
             base_url=base_url,
             provider=provider,
+            api_mode=api_mode,
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -538,6 +547,59 @@ def _make_transport_error(error_type="ReadTimeout"):
 
 
 class TestTryRecoverPrimaryTransport:
+
+    def test_startup_auth_fallback_snapshot_is_never_used_for_recovery(self):
+        """A logical primary without a primary client must fail closed."""
+        agent = _make_agent(
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.6-sol",
+            api_mode="codex_responses",
+        )
+        agent._primary_runtime.update({
+            "model": "claude-opus-5",
+            "provider": "anthropic",
+            "requested_provider": "anthropic",
+            "reasoning_config": {"enabled": True, "effort": "high"},
+            "restorable": False,
+        })
+        error = _make_transport_error("ReadTimeout")
+        original_client = agent.client
+        original_transport_cache = dict(agent._transport_cache)
+        original_client_kwargs = dict(agent._client_kwargs)
+        original_identity = (
+            agent.model,
+            agent.provider,
+            agent.requested_provider,
+            agent.base_url,
+            agent.api_mode,
+            agent.api_key,
+        )
+
+        with (
+            patch.object(agent, "_retire_shared_openai_client") as retire,
+            patch.object(agent, "_create_openai_client") as rebuild,
+            patch("time.sleep") as sleep,
+        ):
+            result = agent._try_recover_primary_transport(
+                error, retry_count=3, max_retries=3,
+            )
+
+        assert result is False
+        retire.assert_not_called()
+        rebuild.assert_not_called()
+        sleep.assert_not_called()
+        assert agent.client is original_client
+        assert agent._transport_cache == original_transport_cache
+        assert agent._client_kwargs == original_client_kwargs
+        assert (
+            agent.model,
+            agent.provider,
+            agent.requested_provider,
+            agent.base_url,
+            agent.api_mode,
+            agent.api_key,
+        ) == original_identity
 
     def test_recovers_on_read_timeout(self):
         agent = _make_agent(provider="custom")

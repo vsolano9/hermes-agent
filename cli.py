@@ -11053,6 +11053,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "model": self.model,
             "provider": self.provider,
             "requested_provider": self.requested_provider,
+            "reasoning_config": copy.deepcopy(
+                getattr(self, "reasoning_config", None)
+            ),
+            "_configured_primary_runtime": copy.deepcopy(
+                getattr(self, "_configured_primary_runtime", None)
+            ),
+            "_startup_auth_fallback_active": getattr(
+                self, "_startup_auth_fallback_active", False
+            ),
             "_explicit_api_key": getattr(self, "_explicit_api_key", None),
             "_explicit_base_url": getattr(self, "_explicit_base_url", None),
             "api_key": self.api_key,
@@ -11071,6 +11080,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "model",
             "provider",
             "requested_provider",
+            "reasoning_config",
+            "_configured_primary_runtime",
+            "_startup_auth_fallback_active",
             "_explicit_api_key",
             "_explicit_base_url",
             "api_key",
@@ -11078,7 +11090,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_mode",
         ):
             if key in snapshot:
-                setattr(self, key, snapshot.get(key))
+                setattr(self, key, copy.deepcopy(snapshot.get(key)))
 
         agent = getattr(self, "agent", None)
         if agent is None:
@@ -11106,6 +11118,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
+
+    def _commit_model_switch_as_configured_primary(self, result) -> None:
+        """Commit a successful persistent/session switch as CLI primary."""
+        agent = getattr(self, "agent", None)
+        selected_reasoning = copy.deepcopy(
+            getattr(agent, "reasoning_config", getattr(self, "reasoning_config", None))
+        )
+        self.reasoning_config = copy.deepcopy(selected_reasoning)
+        # Publish the complete identity before clearing the startup-fallback
+        # latch. A concurrent credential refresh therefore sees either the old
+        # latched primary or this complete selected primary, never active
+        # fallback fields masquerading as the configured route.
+        self._configured_primary_runtime = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "reasoning_config": selected_reasoning,
+        }
+        self._startup_auth_fallback_active = False
 
     @staticmethod
     def _filter_model_picker_entries(entries: list, query: str) -> list:
@@ -11218,6 +11248,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "model": self.model,
             "provider": self.provider,
             "requested_provider": self.requested_provider,
+            "reasoning_config": copy.deepcopy(
+                getattr(self, "reasoning_config", None)
+            ),
+            "_configured_primary_runtime": copy.deepcopy(
+                getattr(self, "_configured_primary_runtime", None)
+            ),
+            "_startup_auth_fallback_active": getattr(
+                self, "_startup_auth_fallback_active", False
+            ),
             "_explicit_api_key": getattr(self, "_explicit_api_key", None),
             "_explicit_base_url": getattr(self, "_explicit_base_url", None),
             "api_key": self.api_key,
@@ -11260,6 +11299,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"staying on {old_model}."
                 )
                 return
+
+        HermesCLI._commit_model_switch_as_configured_primary(self, result)
 
         from hermes_cli.model_switch import format_model_for_display
         _display_old = format_model_for_display(old_model)
@@ -11607,6 +11648,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "model": self.model,
             "provider": self.provider,
             "requested_provider": self.requested_provider,
+            "reasoning_config": copy.deepcopy(
+                getattr(self, "reasoning_config", None)
+            ),
+            "_configured_primary_runtime": copy.deepcopy(
+                getattr(self, "_configured_primary_runtime", None)
+            ),
+            "_startup_auth_fallback_active": getattr(
+                self, "_startup_auth_fallback_active", False
+            ),
             "_explicit_api_key": getattr(self, "_explicit_api_key", None),
             "_explicit_base_url": getattr(self, "_explicit_base_url", None),
             "api_key": self.api_key,
@@ -11648,6 +11698,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"staying on {old_model}."
                 )
                 return
+
+        if not one_turn:
+            HermesCLI._commit_model_switch_as_configured_primary(self, result)
 
         # Store a note to prepend to the next user message so the model
         # knows a switch occurred (avoids injecting system messages mid-history

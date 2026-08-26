@@ -1338,6 +1338,13 @@ def try_recover_primary_transport(
     ):
         return False
 
+    if (getattr(agent, "_primary_runtime", None) or {}).get("restorable") is False:
+        # A startup AuthError can build the CLI directly on fallback transport
+        # while retaining only the configured primary's logical identity. It
+        # has no primary client to rebuild, so recovery must not retire or
+        # mutate the coherent fallback transport before the CLI re-resolves it.
+        return False
+
     try:
         # Retire the existing client to release stale connections. #70773:
         # never hard-close the shared client here — this runs on the
