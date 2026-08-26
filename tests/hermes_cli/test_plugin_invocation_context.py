@@ -1600,7 +1600,7 @@ def test_spawned_child_context_loses_authority_when_handler_execution_ends(
             assert registration is not None
             registration.dispose()
 
-    asyncio.run(scenario())
+    asyncio.get_event_loop().run_until_complete(scenario())
     assert service_calls == []
 
 
