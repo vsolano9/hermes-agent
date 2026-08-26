@@ -4799,7 +4799,12 @@ def _resolve_subagent_route(
         resolved_model = _bounded_route_identifier(
             resolved.get("model"), field="model"
         )
-        if resolved_provider is None or resolved_model is None:
+        if (
+            resolved_provider is None
+            or resolved_model is None
+            or resolved_provider != requested_provider
+            or resolved_model != requested_model
+        ):
             raise ValueError("unresolved route")
 
         from hermes_cli.models import validate_requested_model
@@ -4811,10 +4816,26 @@ def _resolve_subagent_route(
             base_url=resolved.get("base_url"),
             api_mode=resolved.get("api_mode"),
         )
+        active_parent_route = (
+            resolved_provider
+            == _bounded_route_identifier(
+                getattr(parent_agent, "provider", None), field="provider"
+            )
+            and resolved_model
+            == _bounded_route_identifier(
+                getattr(parent_agent, "model", None), field="model"
+            )
+        )
         if (
             not isinstance(validation, dict)
             or validation.get("accepted") is not True
-            or validation.get("recognized") is not True
+            or not (
+                validation.get("recognized") is True
+                or (
+                    active_parent_route
+                    and validation.get("recognized") is False
+                )
+            )
             or validation.get("corrected_model") is not None
         ):
             raise ValueError("model unavailable")
@@ -4985,6 +5006,7 @@ def _profile_auth_evidence(
         candidates.extend(entries)
 
     oauth_provider = auth_type.startswith("oauth")
+    refreshable_without_expiry = provider in {"openai-codex", "xai-oauth"}
     allowed_sources = {
         "device_code",
         "loopback_pkce",
@@ -4995,21 +5017,21 @@ def _profile_auth_evidence(
     reference_candidates = 0
     for candidate in candidates:
         source = str(candidate.get("source") or "").strip().lower()
-        if source.startswith(("env:", "config:")):
-            embedded_secret = any(
-                has_usable_secret(candidate.get(field))
-                for field in ("access_token", "api_key", "agent_key", "token")
-            )
-            if (
-                not embedded_secret
-                and has_usable_secret(candidate.get("secret_fingerprint"))
-            ):
-                # Credential-pool entries intentionally persist only a
-                # fingerprint and source reference. They are well-formed
-                # metadata, not independent auth evidence; the matching
-                # authoritative scope must still provide the actual secret.
-                reference_candidates += 1
-                continue
+        embedded_secret = any(
+            has_usable_secret(candidate.get(field))
+            for field in ("access_token", "api_key", "agent_key", "token")
+        )
+        if (
+            not embedded_secret
+            and has_usable_secret(candidate.get("secret_fingerprint"))
+        ):
+            # Credential-pool entries can persist only a fingerprint and a
+            # host-owned source reference (env/config, gh_cli, etc.). They
+            # are well-formed metadata, not independent auth evidence; the
+            # matching authoritative scope or route resolver must still
+            # provide the actual secret or external-process receipt.
+            reference_candidates += 1
+            continue
         if source and source not in allowed_sources and not source.startswith("manual:"):
             continue
         if str(candidate.get("last_status") or "").strip().lower() == "dead":
@@ -5028,15 +5050,21 @@ def _profile_auth_evidence(
             candidate.get("auth_type") or ""
         ).strip().lower().startswith("oauth")
         if candidate_oauth:
-            expiry = next(
-                (
-                    candidate.get(field)
-                    for field in ("expires_at", "expiresAt", "expires_at_ms")
-                    if candidate.get(field) is not None
-                ),
-                None,
+            expiry_fields = tuple(
+                field
+                for field in ("expires_at", "expiresAt", "expires_at_ms")
+                if field in candidate
             )
-            if not _catalog_expiry_is_fresh(expiry):
+            if expiry_fields:
+                if not all(
+                    _catalog_expiry_is_fresh(candidate.get(field))
+                    for field in expiry_fields
+                ):
+                    continue
+            elif not (
+                refreshable_without_expiry
+                and has_usable_secret(candidate.get("refresh_token"))
+            ):
                 continue
         return "authenticated"
     if candidates and reference_candidates == len(candidates):
@@ -5126,12 +5154,16 @@ def _profile_provider_auth_evidence(
         )
         if isinstance(command, str) and command.strip():
             return "authenticated"
+        if persisted == "reference" and not configured and not required:
+            return "absent"
         return "unprovable" if configured or persisted != "absent" or required else "absent"
 
     scoped_auth = any(has_usable_secret(scope.get(name)) for name in env_names)
     if scoped_auth or persisted == "authenticated":
         return "authenticated"
-    if persisted in {"unprovable", "reference"}:
+    if persisted == "reference":
+        return "unprovable" if required else "absent"
+    if persisted == "unprovable":
         return "unprovable"
     if auth_type == "api_key" or auth_type.startswith("oauth"):
         return "absent"
@@ -5144,8 +5176,10 @@ def _catalog_subagent_routes(parent_agent: Any) -> tuple[tuple[str, str], ...]:
     The catalog consumes only the already-minted authoritative secret mapping,
     the active profile's local config/auth store, and in-repo model snapshots.
     It never calls the interactive picker, provider probes, credential-pool
-    loaders, external CLIs/stores, or mutable model caches. Any stale or
-    unprovable credential/catalog evidence fails the whole snapshot closed.
+    loaders, external CLIs/stores, or mutable model caches. Stale, malformed,
+    or required-but-unprovable routes fail the snapshot closed. Unrelated
+    reference-only entries are omitted because they prove no authenticated
+    route and carry no authority the catalog could expose.
     """
     from agent.secret_scope import (
         current_secret_scope,
@@ -5195,6 +5229,11 @@ def _catalog_subagent_routes(parent_agent: Any) -> tuple[tuple[str, str], ...]:
         if raw_parent_provider
         else None
     )
+    parent_model = (
+        _bounded_route_identifier(getattr(parent_agent, "model", None), field="model")
+        if parent_provider is not None
+        else None
+    )
 
     routes: set[tuple[str, str]] = set()
     descriptors = provider_catalog()
@@ -5240,7 +5279,16 @@ def _catalog_subagent_routes(parent_agent: Any) -> tuple[tuple[str, str], ...]:
             raw_models = _PROVIDER_MODELS.get(provider)
         if not isinstance(raw_models, list) or not raw_models:
             raise OverflowError("profile model inventory is incomplete")
-        for raw_model in raw_models:
+        candidate_models = list(raw_models)
+        if (
+            provider == parent_provider
+            and parent_model is not None
+            and parent_model not in candidate_models
+        ):
+            # The live parent is direct host evidence for its exact active
+            # model even when the bundled snapshot has not caught up yet.
+            candidate_models.append(parent_model)
+        for raw_model in candidate_models:
             if (
                 isinstance(raw_model, str)
                 and len(raw_model.strip()) > _MAX_PUBLIC_ROUTE_IDENTIFIER_CHARS
@@ -5254,12 +5302,8 @@ def _catalog_subagent_routes(parent_agent: Any) -> tuple[tuple[str, str], ...]:
                 raise OverflowError("profile route inventory exceeds public bound")
 
     if parent_provider is not None:
-        parent_model = _bounded_route_identifier(
-            getattr(parent_agent, "model", None), field="model"
-        )
         if (
-            parent_provider is not None
-            and parent_provider != "moa"
+            parent_provider != "moa"
             and parent_provider.lower() not in excluded
             and (parent_model is None or (parent_provider, parent_model) not in routes)
         ):

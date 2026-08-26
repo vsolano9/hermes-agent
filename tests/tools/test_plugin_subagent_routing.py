@@ -120,7 +120,14 @@ def _install_route(monkeypatch, *, provider="synthetic", mode="chat_completions"
     return route
 
 
-def _routed_request(*, mode="exact", toolsets=(), reasoning="high", workdir=None):
+def _routed_request(
+    *,
+    mode="exact",
+    toolsets=(),
+    reasoning="high",
+    workdir=None,
+    provider="synthetic",
+):
     return SubagentLaunchRequestV2(
         api_contract_version=2,
         base=SubagentLaunchRequest(
@@ -130,7 +137,7 @@ def _routed_request(*, mode="exact", toolsets=(), reasoning="high", workdir=None
         ),
         toolset_mode=mode,
         exact_toolsets=toolsets,
-        provider="synthetic",
+        provider=provider,
         reasoning_effort=reasoning,
     )
 
@@ -669,6 +676,7 @@ def test_offline_catalog_requires_fresh_profile_local_oauth(
                 "openai-codex": {
                     "source": "device_code",
                     "access_token": "profile-oauth-canary",
+                    "refresh_token": "profile-refresh-canary",
                     "expires_at": expires_at,
                 }
             }
@@ -711,6 +719,390 @@ def test_offline_catalog_requires_fresh_profile_local_oauth(
                 )
     finally:
         reset_authoritative_secret_scope(token)
+
+
+def test_three_oauth_routes_catalog_assess_and_launch_exact_without_substitution(
+    monkeypatch, tmp_path
+):
+    """Mirror sanitized live auth shapes across public discovery and launch."""
+    (tmp_path / "auth.json").write_text(
+        json.dumps({
+            "providers": {},
+            "credential_pool": {
+                "anthropic": [{
+                    "id": "anthropic-profile-entry",
+                    "source": "manual:hermes_pkce",
+                    "auth_type": "oauth",
+                    "access_token": "anthropic-access-canary",
+                    "refresh_token": "anthropic-refresh-canary",
+                    "expires_at_ms": (time.time() + 3600) * 1000,
+                }],
+                "openai-codex": [{
+                    "id": "codex-profile-entry",
+                    "source": "device_code",
+                    "auth_type": "oauth",
+                    "access_token": "codex-access-canary",
+                    "refresh_token": "codex-refresh-canary",
+                }],
+                "xai-oauth": [{
+                    "id": "xai-profile-entry",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "xai-access-canary",
+                    "refresh_token": "xai-refresh-canary",
+                }],
+                "copilot": [{
+                    "id": "copilot-profile-reference",
+                    "source": "gh_cli",
+                    "auth_type": "oauth",
+                    "secret_fingerprint": "sha256:reference-only-canary",
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [
+            SimpleNamespace(
+                slug="anthropic",
+                auth_type="api_key",
+                api_key_env_vars=(
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                ),
+                keyless=False,
+            ),
+            SimpleNamespace(
+                slug="openai-codex",
+                auth_type="oauth_external",
+                api_key_env_vars=(),
+                keyless=False,
+            ),
+            SimpleNamespace(
+                slug="xai-oauth",
+                auth_type="oauth_external",
+                api_key_env_vars=(),
+                keyless=False,
+            ),
+            SimpleNamespace(
+                slug="copilot",
+                auth_type="api_key",
+                api_key_env_vars=(
+                    "COPILOT_GITHUB_TOKEN",
+                    "GH_TOKEN",
+                    "GITHUB_TOKEN",
+                ),
+                keyless=False,
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._PROVIDER_MODELS",
+        {
+            # The running primary is authoritative even when the bundled
+            # snapshot has not learned that exact model name yet.
+            "anthropic": ["claude-sonnet-5"],
+            "openai-codex": ["gpt-5.6-sol"],
+            "xai-oauth": ["grok-4.6"],
+            "copilot": ["copilot-safe"],
+        },
+    )
+    captured = []
+    _install_child_seams(monkeypatch, captured)
+    transports = {
+        "anthropic": "anthropic_messages",
+        "openai-codex": "codex_responses",
+        "xai-oauth": "chat_completions",
+    }
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda *, requested, target_model: {
+            "provider": requested,
+            "model": target_model,
+            "base_url": f"https://{requested}.invalid/v1",
+            "api_key": f"{requested}-resolved-canary",
+            "api_mode": transports[requested],
+            "request_overrides": {},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda model, provider, **_kwargs: {
+            "accepted": True,
+            # Simulate the exact live gap: the running Claude model has not
+            # reached either the static snapshot or provider listing yet.
+            "recognized": not (
+                provider == "anthropic" and model == "claude-opus-5"
+            ),
+            "corrected_model": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    parent = _parent(provider="anthropic", model="claude-opus-5")
+    service = SubagentLifecycleService(lambda: parent)
+    token = set_authoritative_secret_scope({})
+    try:
+        catalog = service.catalog_routes()
+        targets = (
+            ("anthropic", "claude-opus-5"),
+            ("openai-codex", "gpt-5.6-sol"),
+            ("xai-oauth", "grok-4.6"),
+        )
+        assessments = tuple(
+            service.assess_route(provider, model) for provider, model in targets
+        )
+        handles = tuple(
+            service.launch(SubagentLaunchRequestV2(
+                api_contract_version=2,
+                base=SubagentLaunchRequest(
+                    goal=f"exact read-only {provider}", model=model
+                ),
+                toolset_mode="exact",
+                exact_toolsets=(),
+                provider=provider,
+                reasoning_effort="high",
+            ))
+            for provider, model in targets
+        )
+        waits = tuple(
+            service.wait(handle, timeout_seconds=1) for handle in handles
+        )
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert catalog.complete is True
+    assert catalog.reason == "COMPLETE"
+    route_pairs = {(route.provider, route.model) for route in catalog.routes}
+    assert set(targets).issubset(route_pairs)
+    assert not any(provider == "copilot" for provider, _model in route_pairs)
+    assert all(assessment.eligible is True for assessment in assessments)
+    assert tuple(
+        (assessment.route.provider, assessment.route.model)
+        for assessment in assessments
+    ) == targets
+    assert all(wait.completed is True for wait in waits)
+    assert tuple((handle.provider, handle.model) for handle in handles) == targets
+    assert tuple(
+        (call["override_provider"], call["model"]) for call in captured
+    ) == targets
+
+
+def test_three_oauth_routes_use_real_profile_runtime_resolver(
+    monkeypatch, tmp_path
+):
+    """Exercise the real pool -> runtime -> lifecycle security boundary."""
+    (tmp_path / "auth.json").write_text(
+        json.dumps({
+            "providers": {},
+            "credential_pool": {
+                "anthropic": [{
+                    "id": "anthropic-real-resolver",
+                    "source": "manual:hermes_pkce",
+                    "auth_type": "oauth",
+                    "access_token": "anthropic-real-access-canary",
+                    "refresh_token": "anthropic-real-refresh-canary",
+                    "expires_at_ms": (time.time() + 3600) * 1000,
+                    "base_url": "https://api.anthropic.com",
+                    "last_status": "ok",
+                }],
+                "openai-codex": [{
+                    "id": "codex-real-resolver",
+                    "source": "device_code",
+                    "auth_type": "oauth",
+                    "access_token": "codex-real-access-canary",
+                    "refresh_token": "codex-real-refresh-canary",
+                    "last_status": "ok",
+                }],
+                "xai-oauth": [{
+                    "id": "xai-real-resolver",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "xai-real-access-canary",
+                    "refresh_token": "xai-real-refresh-canary",
+                    "base_url": "https://api.x.ai/v1",
+                    "last_status": "ok",
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  provider: anthropic\n  default: claude-opus-5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    captured = []
+    _install_child_seams(monkeypatch, captured)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "recognized": True,
+            "corrected_model": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    targets = (
+        ("anthropic", "claude-opus-5", "anthropic_messages"),
+        ("openai-codex", "gpt-5.6-sol", "codex_responses"),
+        ("xai-oauth", "grok-4.6", "codex_responses"),
+    )
+    service = SubagentLifecycleService(
+        lambda: _parent(provider="anthropic", model="claude-opus-5")
+    )
+    token = set_authoritative_secret_scope({})
+    try:
+        assessments = tuple(
+            service.assess_route(provider, model)
+            for provider, model, _transport in targets
+        )
+        handles = tuple(
+            service.launch(SubagentLaunchRequestV2(
+                api_contract_version=2,
+                base=SubagentLaunchRequest(
+                    goal=f"real resolver {provider}", model=model
+                ),
+                toolset_mode="exact",
+                exact_toolsets=(),
+                provider=provider,
+            ))
+            for provider, model, _transport in targets
+        )
+        waits = tuple(
+            service.wait(handle, timeout_seconds=1) for handle in handles
+        )
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert tuple(
+        (
+            assessment.route.provider,
+            assessment.route.model,
+            assessment.transport,
+            assessment.eligible,
+        )
+        for assessment in assessments
+    ) == tuple((*target, True) for target in targets)
+    assert all(wait.completed is True for wait in waits)
+    assert tuple((handle.provider, handle.model) for handle in handles) == tuple(
+        (provider, model) for provider, model, _transport in targets
+    )
+    assert tuple(
+        (
+            call["override_provider"],
+            call["model"],
+            call["override_api_mode"],
+        )
+        for call in captured
+    ) == targets
+    assert tuple(call["override_api_key"] for call in captured) == (
+        "anthropic-real-access-canary",
+        "codex-real-access-canary",
+        "xai-real-access-canary",
+    )
+
+
+@pytest.mark.parametrize("expires_at", [None, "not-a-timestamp", 1])
+def test_offline_catalog_rejects_explicit_invalid_oauth_expiry_even_with_refresh_token(
+    monkeypatch, tmp_path, expires_at
+):
+    (tmp_path / "auth.json").write_text(
+        json.dumps({
+            "credential_pool": {
+                "xai-oauth": [{
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "xai-access-canary",
+                    "refresh_token": "xai-refresh-canary",
+                    "expires_at": expires_at,
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [SimpleNamespace(
+            slug="xai-oauth",
+            auth_type="oauth_external",
+            api_key_env_vars=(),
+            keyless=False,
+        )],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._PROVIDER_MODELS", {"xai-oauth": ["grok-4.6"]}
+    )
+    service = SubagentLifecycleService(
+        lambda: _parent(provider="xai-oauth", model="grok-4.6")
+    )
+    token = set_authoritative_secret_scope({})
+    try:
+        catalog = service.catalog_routes()
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert catalog.complete is False
+    assert catalog.routes == ()
+    assert catalog.reason == "CATALOG_INCOMPLETE"
+
+
+def test_reference_only_active_provider_keeps_catalog_incomplete(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "auth.json").write_text(
+        json.dumps({
+            "credential_pool": {
+                "copilot": [{
+                    "source": "gh_cli",
+                    "auth_type": "oauth",
+                    "secret_fingerprint": "sha256:reference-only-canary",
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.provider_catalog.provider_catalog",
+        lambda: [
+            SimpleNamespace(
+                slug="copilot",
+                auth_type="api_key",
+                api_key_env_vars=("GH_TOKEN",),
+                keyless=False,
+            ),
+            SimpleNamespace(
+                slug="opencode-free",
+                auth_type="api_key",
+                api_key_env_vars=(),
+                keyless=True,
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models._PROVIDER_MODELS",
+        {"copilot": ["copilot-safe"], "opencode-free": ["free-safe"]},
+    )
+    service = SubagentLifecycleService(
+        lambda: _parent(provider="copilot", model="copilot-safe")
+    )
+    token = set_authoritative_secret_scope({})
+    try:
+        catalog = service.catalog_routes()
+    finally:
+        reset_authoritative_secret_scope(token)
+
+    assert catalog.complete is False
+    assert catalog.routes == ()
+    assert catalog.reason == "CATALOG_INCOMPLETE"
 
 
 def _profile_tree_snapshot(root):
@@ -1164,6 +1556,99 @@ def test_unavailable_or_unverified_model_fails_before_admission_and_build(
     assert delegation_admission.active_background_units() == 0
 
 
+@pytest.mark.parametrize(
+    ("mismatch_field", "mismatched_value"),
+    [
+        pytest.param("provider", "substituted-provider", id="provider"),
+        pytest.param("model", "substituted-model", id="model"),
+    ],
+)
+def test_resolved_route_identity_mismatch_fails_assessment_and_launch_before_build(
+    monkeypatch, mismatch_field, mismatched_value
+):
+    captured = []
+    _install_child_seams(monkeypatch, captured)
+    resolved = {
+        "provider": "synthetic",
+        "model": "model-a",
+        "base_url": "https://profile-a.invalid/v1",
+        "api_key": "profile-a-secret",
+        "api_mode": "chat_completions",
+        "request_overrides": {},
+    }
+    resolved[mismatch_field] = mismatched_value
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_delegation_credentials",
+        lambda *_args, **_kwargs: dict(resolved),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "recognized": True,
+            "corrected_model": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    service = SubagentLifecycleService(lambda: _parent())
+
+    assessment = service.assess_route("synthetic", "model-a")
+    with pytest.raises(SubagentLifecycleError) as caught:
+        service.launch(_routed_request())
+
+    assert assessment.reason == "ROUTE_UNAVAILABLE"
+    assert assessment.eligible is False
+    assert assessment.authenticated is False
+    assert str(caught.value) == "Requested provider/model route is unavailable."
+    assert captured == []
+    assert delegation_admission.active_background_units() == 0
+
+
+@pytest.mark.parametrize(
+    ("recognized_fields", "launchable"),
+    [
+        pytest.param({"recognized": False}, True, id="literal-false"),
+        pytest.param({}, False, id="missing"),
+        pytest.param({"recognized": None}, False, id="null"),
+        pytest.param({"recognized": "false"}, False, id="string"),
+        pytest.param({"recognized": 0}, False, id="numeric"),
+        pytest.param({"recognized": {}}, False, id="mapping"),
+        pytest.param({"recognized": object()}, False, id="object"),
+    ],
+)
+def test_active_parent_recognition_bypass_requires_literal_false(
+    monkeypatch, recognized_fields, launchable
+):
+    captured = []
+    _install_child_seams(monkeypatch, captured)
+    _install_route(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "corrected_model": None,
+            **recognized_fields,
+        },
+    )
+    service = SubagentLifecycleService(
+        lambda: _parent(provider="synthetic", model="model-a")
+    )
+
+    if launchable:
+        handle = service.launch(_routed_request())
+        assert service.wait(handle, timeout_seconds=1).completed is True
+        assert (handle.provider, handle.model) == ("synthetic", "model-a")
+        assert len(captured) == 1
+    else:
+        with pytest.raises(SubagentLifecycleError) as caught:
+            service.launch(_routed_request())
+        assert str(caught.value) == "Requested provider/model route is unavailable."
+        assert captured == []
+        assert delegation_admission.active_background_units() == 0
+
+
 def test_provider_only_route_validates_parent_model_before_build(monkeypatch):
     captured = []
     validated = []
@@ -1391,12 +1876,12 @@ def test_exact_empty_native_read_only_transport_is_allowlisted_and_fail_closed(
 
     service = SubagentLifecycleService(lambda: _parent())
     if eligible:
-        handle = service.launch(_routed_request())
+        handle = service.launch(_routed_request(provider=provider))
         assert service.wait(handle, timeout_seconds=1).completed is True
         assert len(captured) == 1
     else:
         with pytest.raises(SubagentLifecycleError) as caught:
-            service.launch(_routed_request())
+            service.launch(_routed_request(provider=provider))
         assert str(caught.value) == "Native read-only transport is unavailable."
         assert captured == []
         assert delegation_admission.active_background_units() == 0
@@ -1412,7 +1897,11 @@ def test_transport_gate_does_not_reinterpret_routed_inherit_or_exact_nonempty(
     service = SubagentLifecycleService(lambda: _parent())
 
     for mode, toolsets in (("inherit", ()), ("exact", ("file",))):
-        handle = service.launch(_routed_request(mode=mode, toolsets=toolsets))
+        handle = service.launch(
+            _routed_request(
+                mode=mode, toolsets=toolsets, provider="copilot-acp"
+            )
+        )
         assert service.wait(handle, timeout_seconds=1).completed is True
 
     assert [call["exact_toolsets"] for call in captured] == [False, True]

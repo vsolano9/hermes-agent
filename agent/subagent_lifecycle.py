@@ -735,7 +735,9 @@ class SubagentLifecycleService:
 
         Discovery is read-only and never constructs a child or consumes
         admission. Any unsafe, malformed, or oversized inventory collapses to
-        a fixed incomplete receipt rather than exposing a partial catalog.
+        a fixed incomplete receipt rather than exposing an unsafe partial
+        catalog. Unrelated reference-only credential metadata is safely
+        omitted because it does not prove an authenticated route.
         """
         parent = self._parent_agent_resolver()
         if parent is None:

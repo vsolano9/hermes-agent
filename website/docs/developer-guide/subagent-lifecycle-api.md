@@ -70,8 +70,20 @@ constructing a child, consuming admission, or creating lifecycle state:
   already-minted secret snapshot, exact local config/auth snapshots, and immutable
   in-repo model catalogs. It never probes providers, refreshes credentials,
   seeds pools, writes caches, invokes external credential stores, or borrows
-  process/global-profile credentials. Stale or unprovable evidence makes the
-  whole catalog incomplete.
+  process/global-profile credentials. Stale, malformed, or required-but-
+  unprovable route evidence makes the whole catalog incomplete. An unrelated
+  reference-only pool entry (for example, a fingerprint pointing at a host
+  CLI credential) is omitted instead of invalidating independently proven
+  routes. Refreshable Codex and xAI OAuth pool entries remain provable without
+  an explicit expiry when they retain both their access and refresh tokens;
+  an explicit stale or malformed expiry still fails closed. The running
+  parent's exact provider/model pair may supplement a lagging bundled model
+  snapshot because the host is already executing that bounded active route;
+  it still must pass the same profile-auth and exclusion gates. Assessment and
+  launch allow that exact already-running parent pair to survive a literal
+  `recognized: false` stale-model result, but still require accepted validation, resolved
+  credentials, an unchanged provider/model identity, no correction, and every
+  normal tool and transport gate. Other unknown models remain unavailable.
   Bound-profile Bedrock routes currently remain unavailable even when the
   profile contains AWS credentials: the native worker does not yet accept a
   retained profile-private AWS bundle, so Hermes cannot prove that boto and
