@@ -5,6 +5,8 @@ Diagnoses issues with Hermes Agent setup.
 """
 
 import os
+import re
+import stat
 import sys
 import subprocess
 import shutil
@@ -1154,52 +1156,217 @@ def _macos_desktop_dr(app: Path) -> str | None:
     return (proc.stdout or "") + (proc.stderr or "")
 
 
-def check_macos_tcc_anchor(should_fix: bool = False) -> None:
-    """macOS TCC anchor check (issue #85345).
+_TCC_UV_INSTALL_RE = re.compile(
+    r"^cpython-(\d+)\.(\d+)\.(\d+)-macos-(aarch64|x86_64)-none$"
+)
 
-    TCC keys permission grants to the interpreter's resolved path; uv-managed
-    interpreters move on every patch bump, orphaning grants and re-triggering
-    the permission-prompt storm after each update.  A stable real-file copy of
-    the interpreter inside the venv keeps the TCC client path constant.
-    Silent on non-macOS; informational when the interpreter already has a
-    stable path.
-    """
+
+def _tcc_owned_secure_file(path: Path, *, executable: bool = False) -> os.stat_result:
+    """Return a trusted lstat for a legacy-anchor recovery input."""
+    value = path.lstat()
+    if not stat.S_ISREG(value.st_mode):
+        raise ValueError(f"{path.name} is not a regular file")
+    if value.st_uid != os.getuid():
+        raise ValueError(f"{path.name} is not owned by the current user")
+    mode = stat.S_IMODE(value.st_mode)
+    if mode & 0o022:
+        raise ValueError(f"{path.name} is group- or world-writable")
+    if executable and mode != 0o755:
+        raise ValueError(f"{path.name} does not have the expected 0755 mode")
+    return value
+
+
+def _tcc_pyvenv_fields(venv_dir: Path) -> dict[str, str]:
+    config = venv_dir / "pyvenv.cfg"
+    _tcc_owned_secure_file(config)
+    fields: dict[str, str] = {}
+    for line in config.read_text(encoding="utf-8", errors="strict").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key.strip().lower()] = value.strip()
+    return fields
+
+
+def _trusted_tcc_anchor_source(venv_dir: Path, source: Path) -> Path:
+    """Validate a marker target against the venv's canonical uv interpreter."""
+    if not source.is_absolute():
+        raise ValueError("anchor source is not absolute")
+    # The old writer could record pyvenv.cfg's version-family home alias, but
+    # never a symlink as the final interpreter leaf.
+    _tcc_owned_secure_file(source, executable=True)
+
+    fields = _tcc_pyvenv_fields(venv_dir)
+    if not fields.get("uv"):
+        raise ValueError("pyvenv.cfg does not identify a uv-managed venv")
+    version_match = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)?", fields.get("version_info", ""))
+    home_text = fields.get("home", "")
+    if version_match is None or not home_text:
+        raise ValueError("pyvenv.cfg has no canonical interpreter identity")
+    home = Path(home_text)
+    if not home.is_absolute():
+        raise ValueError("pyvenv.cfg home is not absolute")
+    expected_raw = home / f"python{version_match.group(1)}.{version_match.group(2)}"
     try:
-        from hermes_cli.macos_tcc_anchor import ensure_tcc_anchor, tcc_anchor_state
+        expected = expected_raw.resolve(strict=True)
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("canonical uv interpreter does not exist") from exc
+    if source not in {expected_raw, expected} or resolved != expected:
+        raise ValueError("anchor source does not match pyvenv.cfg")
+    source = resolved
 
-        status, detail = tcc_anchor_state()
-        if status == "skip":
-            if detail == "interpreter not uv-managed (stable path)":
-                check_ok("Python interpreter path is stable", "(not uv-managed)")
-            return
-        if status == "active":
-            check_ok(
-                "macOS TCC anchor active",
-                f"(interpreter pinned at {detail}; grants survive updates)",
-            )
-            return
-        label = "stale" if status == "stale" else "missing"
-        if should_fix:
-            anchored = ensure_tcc_anchor()
-            if anchored is not None:
-                check_ok(
-                    "macOS TCC anchor installed",
-                    f"(interpreter pinned at {anchored}; grants survive updates)",
-                )
-                return
-            check_warn(
-                "macOS TCC anchor could not be installed",
-                "macOS will re-prompt for permissions after each Python update",
-            )
-            return
-        check_warn(
-            f"macOS TCC anchor {label}",
-            "the uv-managed interpreter path changes on every Python patch "
-            "bump, so macOS will re-prompt for permissions after each update. "
-            "Run `hermes doctor --fix` to pin the interpreter at a stable path.",
+    install = source.parent.parent
+    install_match = _TCC_UV_INSTALL_RE.fullmatch(install.name)
+    if (
+        source.parent.name != "bin"
+        or install.parent.name != "python"
+        or install.parent.parent.name != "uv"
+        or install_match is None
+        or install_match.group(1) != version_match.group(1)
+        or install_match.group(2) != version_match.group(2)
+    ):
+        raise ValueError("anchor source is not a canonical macOS uv interpreter")
+
+    # Validate the complete security boundary from the uv store root down.
+    uv_root = install.parent.parent
+    for component in (uv_root, install.parent, install, source.parent):
+        value = component.lstat()
+        if not stat.S_ISDIR(value.st_mode) or value.st_uid != os.getuid():
+            raise ValueError("uv interpreter path is not owned by the current user")
+        if stat.S_IMODE(value.st_mode) & 0o022:
+            raise ValueError("uv interpreter path is group- or world-writable")
+    _tcc_owned_secure_file(source, executable=True)
+    return source
+
+
+def _atomic_tcc_symlink(target: str | Path, destination: Path) -> None:
+    tmp = destination.parent / f".{destination.name}.unanchor-tmp"
+    tmp.unlink(missing_ok=True)
+    try:
+        os.symlink(target, tmp)
+        os.replace(tmp, destination)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _looks_like_unmarked_tcc_anchor(venv_dir: Path) -> bool:
+    """Conservatively identify an old uv anchor whose marker was lost."""
+    venv_py = venv_dir / "bin" / "python"
+    try:
+        fields = _tcc_pyvenv_fields(venv_dir)
+        return (
+            venv_py.is_file()
+            and not venv_py.is_symlink()
+            and bool(fields.get("uv"))
+            and "/uv/python/" in fields.get("home", "").replace("\\", "/")
+            and "-macos-" in fields.get("home", "")
         )
-    except Exception as e:  # diagnostics must never crash
-        check_warn(f"macOS TCC anchor check failed: {e}")
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def check_macos_tcc_anchor_removed() -> None:
+    """Detect and repair a venv bricked by the reverted TCC anchor.
+
+    The anchor (#95131/#95478, reverted) replaced ``venv/bin/python`` with a
+    real-file copy of the uv-store interpreter. On real Macs that copy could
+    not start: its ``LC_RPATH`` (``@executable_path/../lib``) resolved to
+    ``venv/lib/``, which holds no libpython — every hermes command died in
+    dyld (#95425), and re-pointed aliases lost the stdlib (#95541). The
+    revert stops NEW anchors; this check heals venvs the anchor already
+    converted, by restoring ``bin/python`` to a symlink pointing at the
+    recorded source interpreter (the marker file the anchor wrote).
+    Silent on non-macOS and on venvs the anchor never touched.
+    """
+    if sys.platform != "darwin":
+        return
+    # Resolved at call time via the module global so tests can retarget it.
+    root = Path(globals()["__file__"]).resolve().parents[1]
+    for name in ("venv", ".venv"):
+        venv_dir = root / name
+        venv_bin = venv_dir / "bin"
+        marker = venv_bin / ".tcc-anchor-source"
+        try:
+            marker_stat = marker.lstat()
+        except FileNotFoundError:
+            if _looks_like_unmarked_tcc_anchor(venv_dir):
+                check_warn(
+                    "macOS TCC anchor cleanup failed",
+                    f"({name}/bin/python is an old uv anchor but its recovery "
+                    "marker is missing; interpreter left unchanged)",
+                )
+            continue
+        try:
+            marker_stat = _tcc_owned_secure_file(marker)
+            marker_text = marker.read_text(encoding="utf-8", errors="strict")
+            if not marker_text or marker_text != marker_text.strip() or len(marker_text) > 4096:
+                raise ValueError("anchor recovery marker is malformed")
+            source = _trusted_tcc_anchor_source(venv_dir, Path(marker_text))
+            venv_py = venv_bin / "python"
+            venv_stat = venv_py.lstat()
+            if venv_stat.st_uid != os.getuid():
+                raise ValueError("venv interpreter is not owned by the current user")
+            if stat.S_ISLNK(venv_stat.st_mode):
+                if os.readlink(venv_py) != str(source):
+                    raise ValueError("partially healed interpreter points elsewhere")
+            elif stat.S_ISREG(venv_stat.st_mode):
+                if stat.S_IMODE(venv_stat.st_mode) != 0o755:
+                    raise ValueError("anchored interpreter does not have mode 0755")
+                if os.path.samefile(venv_py, source):
+                    raise ValueError("anchor source targets the venv interpreter itself")
+            else:
+                raise ValueError("venv interpreter is not a regular file or symlink")
+
+            # The old anchor owned only these two aliases. Validate every
+            # existing target before making the first mutation.
+            aliases: list[Path] = []
+            for alias_name in dict.fromkeys(("python3", source.name)):
+                alias = venv_bin / alias_name
+                try:
+                    alias_stat = alias.lstat()
+                except FileNotFoundError:
+                    continue
+                if alias_stat.st_uid != os.getuid():
+                    raise ValueError(f"owned alias {alias_name} has the wrong owner")
+                if not stat.S_ISLNK(alias_stat.st_mode):
+                    raise ValueError(f"owned alias {alias_name} is not a symlink")
+                if alias.resolve(strict=False) not in {venv_py.resolve(strict=False), source}:
+                    raise ValueError(f"owned alias {alias_name} points elsewhere")
+                aliases.append(alias)
+
+            if not venv_py.is_symlink():
+                _atomic_tcc_symlink(source, venv_py)
+            for alias in aliases:
+                if os.readlink(alias) != "python":
+                    _atomic_tcc_symlink("python", alias)
+
+            # Do not consume recovery state until every owned target and the
+            # original marker/source identity have been revalidated.
+            if not venv_py.is_symlink() or os.readlink(venv_py) != str(source):
+                raise ValueError("interpreter restore did not complete")
+            for alias in aliases:
+                if not alias.is_symlink() or os.readlink(alias) != "python":
+                    raise ValueError(f"alias restore did not complete for {alias.name}")
+            current_marker = marker.lstat()
+            if (
+                current_marker.st_dev != marker_stat.st_dev
+                or current_marker.st_ino != marker_stat.st_ino
+                or current_marker.st_size != marker_stat.st_size
+                or current_marker.st_mtime_ns != marker_stat.st_mtime_ns
+            ):
+                raise ValueError("anchor recovery marker changed during cleanup")
+            _trusted_tcc_anchor_source(venv_dir, source)
+            marker.unlink(missing_ok=True)
+            check_ok(
+                "macOS TCC anchor removed",
+                f"({name}/bin/python restored to a symlink; the anchor "
+                "(#95425/#95541) is reverted)",
+            )
+        except Exception as e:  # diagnostics must never crash
+            check_warn(
+                "macOS TCC anchor cleanup failed",
+                f"({e}) — recovery marker preserved at {marker}",
+            )
 
 
 def run_doctor(args):
@@ -1372,9 +1539,10 @@ def run_doctor(args):
     else:
         check_warn("Not in virtual environment", "(recommended)")
 
-    # macOS TCC anchor (issue #85345): uv-managed interpreter paths move on
-    # every patch bump and orphan TCC grants. Silent on non-macOS.
-    check_macos_tcc_anchor(should_fix)
+    # macOS TCC anchor REVERTED (#95425/#95541: anchored copies couldn't load
+    # libpython — every hermes command died in dyld). This heals venvs the
+    # anchor already converted. Silent on non-macOS.
+    check_macos_tcc_anchor_removed()
 
     # Detect drift between pyproject.toml and hermes_cli/__init__.py versions
     # (a git conflict resolution can silently revert one but not the other).
