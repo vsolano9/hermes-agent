@@ -22,16 +22,25 @@ app-server can have different versions. OpenAI documents both the daemon and
 app-server protocol as experimental and guarantees generated schemas only for
 the Codex version that generated them. The generated 0.149 v2 protocol has
 the three model-free calls needed here: `mcpServerStatus/list`,
-`mcpServer/tool/call`, and `thread/delete`. `thread/start` accepts
-`ephemeral: true`. None of these operations requires `turn/start`, and Hermes
-must never invoke a Codex model to execute a Computer Use call.
+`mcpServer/tool/call`, and `thread/delete`. None of these operations requires
+`turn/start`, and Hermes must never invoke a Codex model to execute a Computer
+Use call.
+
+Live protocol proof against signed managed `0.149.0-alpha.4.3` exposed two
+important lifecycle details. First, MCP startup emits roughly thirty status
+notifications before returning the full catalog. Second, threads created with
+`ephemeral: true` reject `thread/delete`, and closing their client connection
+leaves their MCP child stack until the daemon's 30-minute idle unload. A
+temporary thread created with `ephemeral: false` can be hard-deleted: deletion
+returns success, removes it from list/read, leaves no rollout file, and tears
+down the newly created MCP children.
 
 Decision:
 - Keep Claude Opus as the sole orchestrator. Route each granted Computer Use
   operation through a new `CodexCUABroker.call(...)` boundary that hides
   daemon discovery, trust validation, one fresh socket connection, one
-  ephemeral thread, exact catalog attestation, the tool call, and mandatory
-  thread deletion.
+  temporary deletable control thread, exact catalog attestation, the tool
+  call, and mandatory thread deletion.
 - Resolve only `/Applications/ChatGPT.app/Contents/Resources/codex` as the
   signed lifecycle controller. Before a daemon start, verify the ChatGPT
   bundle and CLI designated requirements for OpenAI team `2DC432GLL2`, reject
@@ -59,30 +68,35 @@ Decision:
   `managedCodexVersion == appServerVersion == initialize userAgent version`.
   Launcher/managed equality is not required. The observed signed 0.147 daemon
   remains rejected: its full status row omits `pluginId`, changes
-  `serverInfo`, and refuses `thread/delete` for ephemeral threads. Operators
+  `serverInfo`, and changes the catalog contract. Operators
   move the managed runtime through OpenAI's exact-release installer and daemon
   restart; Hermes never substitutes or downloads a binary itself.
 - For every call, connect directly to the Unix socket with WebSocket framing,
-  initialize, start an ephemeral thread, request the complete MCP status
+  initialize, start a temporary persisted thread (`ephemeral: false`), require
+  its nonempty rollout path, request the complete MCP status
   catalog, and attest the exact CUA plugin id and immutable ten-tool digest
   before sending `mcpServer/tool/call`. Once `thread/start` returns its id,
   delete the thread in `finally` on success, server error, timeout, or
-  cancellation. If creation itself loses its response before the id is known,
-  close the fresh connection and send no tool call; the protocol exposes no
-  safe correlated thread identity to delete.
+  cancellation. Do not accept the ephemeral-thread `-32600` deletion response
+  as cleanup success for this persisted contract. If creation itself loses its
+  response before the id is known, close the fresh connection and send no tool
+  call; the protocol exposes no safe correlated thread identity to delete.
 - ChatGPT Codex `0.149.0-alpha.4.3`'s generated
   `ListMcpServerStatusResponse` has no `runtimeStatus` field. Require its real
   full thread-scoped shape instead: one exact server/plugin row, explicit
-  `authStatus: unsupported`, zero resources/templates, all ten complete Tool
+  `authStatus: unsupported`, exact `Computer Use` server identity/version,
+  zero resources/templates, all ten complete App-Server-decorated Tool
   contracts and annotations, and no unknown row/tool fields. The subsequent
   live `mcpServer/tool/call` is the operational proof. Unknown future fields
   fail closed rather than disappearing from the catalog digest.
 - Bound catalog pages and rows and share one absolute deadline across binary
   attestation, daemon readiness, initialization, thread creation, catalog, and
-  tool dispatch. Event queues are bounded; overflow makes the transport
-  terminal. The broker promptly rejects every server-initiated request because
-  Hermes's own grants and high-impact confirmation are the only approval
-  authority.
+  tool dispatch. Ordinary model-runtime event queues remain bounded and
+  terminal on overflow. The model-free broker explicitly discards only
+  syntactically valid notifications after JSON-RPC envelope/method validation,
+  because it has no event consumer. The broker promptly rejects every
+  server-initiated request because Hermes's own grants and high-impact
+  confirmation are the only approval authority.
 - Keep all existing Hermes gates before broker work: trust/confirmation,
   exact grant/state checks, account-global single-writer flock, and circuit
   breaker. Reuse the existing MCP result renderer so text, images, audio,
@@ -107,7 +121,8 @@ Alternatives considered:
   and retry ambiguity, and bypasses the maintained shared-daemon boundary.
 - Expose app-server/thread orchestration directly from `mcp_tool.py`.
   Rejected because callers would need to understand version checks, socket
-  trust, ephemeral-thread cleanup, catalog attestation, and protocol ambiguity.
+  trust, temporary-thread hard deletion, catalog attestation, and protocol
+  ambiguity.
   The broker is a deeper and safer boundary.
 
 Consequences:
@@ -121,7 +136,16 @@ Consequences:
   allowlist; currently this means exact 0.149.0-alpha.4.3 only.
 - The first granted call may pay daemon-readiness latency; later calls reuse
   one account-global daemon but still receive isolated connections and
-  ephemeral threads.
+  temporary persisted threads that are hard-deleted before disconnect.
+- A hard process kill can occur after `thread/start` returns but before the
+  `finally` block deletes its thread. The current protocol does not expose an
+  atomic broker marker: `serviceName` is not retained, and no-turn control
+  threads are absent from both `thread/list` and `thread/loaded/list`. Hermes
+  therefore does not scan or delete user threads by a weak cwd/name heuristic.
+  Codex's 30-minute idle unload bounds the in-memory MCP stack in this crash
+  case; an operator daemon restart is the only immediate recovery. A cleanup
+  RPC is not retried after an ambiguous accepted frame because the generated
+  protocol does not declare `thread/delete` idempotent.
 - The implementation is macOS-only and intentionally has no compatibility
   fallback to an unsigned or model-mediated launcher.
 - The cooperative OS account and the Hermes code/configuration it loads are

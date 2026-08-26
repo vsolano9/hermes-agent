@@ -246,6 +246,7 @@ class CodexAppServerClient:
         connection: Optional[CodexAppServerConnection] = None,
         reject_server_requests: bool = False,
         event_queue_limit: int = _DEFAULT_EVENT_QUEUE_LIMIT,
+        discard_notifications: bool = False,
     ) -> None:
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
@@ -324,6 +325,10 @@ class CodexAppServerClient:
         self._notifications: queue.Queue = queue.Queue(maxsize=event_queue_limit)
         self._server_requests: queue.Queue = queue.Queue(maxsize=event_queue_limit)
         self._reject_server_requests = reject_server_requests
+        # Model runtimes consume the bounded notification queue. Narrow
+        # synchronous protocol clients may opt out only when events are not
+        # part of their contract; frame and method validation still runs.
+        self._discard_notifications = discard_notifications
         self._send_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
@@ -616,6 +621,16 @@ class CodexAppServerClient:
                 raise CodexAppServerTransportError(
                     "codex app-server sent an invalid JSON-RPC method"
                 )
+            if "result" in msg or "error" in msg:
+                raise CodexAppServerTransportError(
+                    "codex app-server sent a malformed JSON-RPC notification"
+                )
+            if "params" in msg and not isinstance(msg["params"], (dict, list)):
+                raise CodexAppServerTransportError(
+                    "codex app-server sent invalid JSON-RPC notification params"
+                )
+            if self._discard_notifications:
+                return
             try:
                 self._notifications.put_nowait(msg)
             except queue.Full as exc:

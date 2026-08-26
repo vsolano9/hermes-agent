@@ -291,6 +291,108 @@ def test_default_runtime_queue_preserves_legitimate_burst_order() -> None:
         client.close()
 
 
+def test_broker_notification_sink_discards_validated_burst_without_closing() -> None:
+    frames: queue.Queue = queue.Queue()
+    sent = threading.Event()
+    closed = threading.Event()
+
+    class BurstThenReplyConnection:
+        def send_text(self, payload):
+            request = json.loads(payload)
+            for index in range(32):
+                frames.put(json.dumps({
+                    "method": "mcpServer/startupStatus/updated",
+                    "params": {"n": index},
+                }))
+            frames.put(json.dumps({
+                "id": request["id"],
+                "result": {"value": "still-live"},
+            }))
+            sent.set()
+
+        def recv_text(self):
+            sent.wait(1.0)
+            return frames.get(timeout=2.0)
+
+        def close(self, timeout=3.0):
+            del timeout
+            closed.set()
+
+        def is_alive(self):
+            return not closed.is_set()
+
+        def stderr_tail(self, n=20):
+            del n
+            return []
+
+    client = CodexAppServerClient(
+        connection=BurstThenReplyConnection(),
+        discard_notifications=True,
+        event_queue_limit=4,
+    )
+    try:
+        assert client.request("fixture/after-burst", timeout=2.0) == {
+            "value": "still-live"
+        }
+        assert client.take_notification() is None
+        assert client.is_alive()
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"method": 42, "params": {}},
+        {"method": "fixture/noise", "result": {"unexpected": True}},
+        {
+            "method": "fixture/noise",
+            "error": {"code": -32600, "message": "not a notification"},
+        },
+        {"method": "fixture/noise", "params": 42},
+    ],
+)
+def test_broker_notification_sink_still_rejects_malformed_notification(
+    malformed,
+) -> None:
+    frames: queue.Queue = queue.Queue()
+    sent = threading.Event()
+    closed = threading.Event()
+
+    class MalformedNotificationConnection:
+        def send_text(self, payload):
+            del payload
+            frames.put(json.dumps(malformed))
+            sent.set()
+
+        def recv_text(self):
+            sent.wait(1.0)
+            return frames.get(timeout=2.0)
+
+        def close(self, timeout=3.0):
+            del timeout
+            closed.set()
+
+        def is_alive(self):
+            return not closed.is_set()
+
+        def stderr_tail(self, n=20):
+            del n
+            return []
+
+    client = CodexAppServerClient(
+        connection=MalformedNotificationConnection(),
+        discard_notifications=True,
+        event_queue_limit=4,
+    )
+    try:
+        with pytest.raises(CodexAppServerTransportError):
+            client.request("fixture/malformed", timeout=2.0)
+        assert closed.wait(1.0)
+    finally:
+        client.close()
+
+
 def test_server_request_rejection_policy_responds_without_deadlock() -> None:
     socket_path = Path("/tmp") / f"hermes-cas-{uuid.uuid4().hex[:12]}.sock"
     rejected = queue.Queue(maxsize=1)

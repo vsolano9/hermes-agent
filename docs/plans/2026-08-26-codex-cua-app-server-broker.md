@@ -4,7 +4,7 @@
 
 **Goal:** Route Hermes's exact ten Codex Computer Use tools through the signed, model-free Codex app-server daemon while preserving every existing Hermes approval, grant, serialization, and result contract.
 
-**Architecture:** `agent/transports/codex_app_server.py` gains a connection abstraction shared by the existing stdio client and a Unix-domain WebSocket connection. A new `agent/transports/codex_cua_broker.py` owns signed binary resolution, daemon/socket readiness, per-call ephemeral threads, exact app-server MCP attestation, direct tool calls, and cleanup. `tools/mcp_tool.py` selects the broker only for the reserved host-pinned transport after all existing gates and renders its response through the same MCP sanitation path.
+**Architecture:** `agent/transports/codex_app_server.py` gains a connection abstraction shared by the existing stdio client and a Unix-domain WebSocket connection. A new `agent/transports/codex_cua_broker.py` owns signed binary resolution, daemon/socket readiness, per-call temporary persisted control threads, exact app-server MCP attestation, direct tool calls, and hard-delete cleanup. `tools/mcp_tool.py` selects the broker only for the reserved host-pinned transport after all existing gates and renders its response through the same MCP sanitation path.
 
 **Tech Stack:** Python 3.11+, JSON-RPC 2.0, `websockets==15.0.1`, Unix domain sockets, macOS `codesign`, `fcntl.flock`, pytest through `scripts/run_tests.sh`.
 
@@ -58,7 +58,7 @@ Expected RED: the client has no UDS WebSocket connection seam.
 
 **Proof:** Run the trust suite repeatedly and verify it creates no live daemon or user-config mutation by injecting the command/connection seams.
 
-## Slice 3: One model-free, ephemeral, attested broker call
+## Slice 3: One model-free, deletable, attested broker call
 
 **Behavior seam:** `CodexCUABroker.call(tool, arguments, timeout)` returns one MCP `CallToolResult`-shaped value after an exact catalog attestation and always attempts `thread/delete`.
 
@@ -66,9 +66,9 @@ Expected RED: the client has no UDS WebSocket connection seam.
 - Modify `agent/transports/codex_cua_broker.py`
 - Add `tests/agent/transports/test_codex_cua_broker_call.py`
 
-**RED:** Use protocol fixtures shaped like generated ChatGPT 0.149 schemas. Assert the exact sequence `initialize` → `thread/start {ephemeral:true}` → paginated `mcpServerStatus/list` → `mcpServer/tool/call` → `thread/delete`; assert no `turn/start`. Cover exact plugin id/digest, catalog/version drift, pagination bounds/deadline, success, MCP error, generic RPC ambiguity, timeout, cancellation, transport loss, malformed MCP content, and cleanup failure.
+**RED:** Use protocol fixtures shaped like generated ChatGPT 0.149 schemas. Assert the exact sequence `initialize` → `thread/start {ephemeral:false}` → paginated `mcpServerStatus/list` → `mcpServer/tool/call` → `thread/delete`; assert no `turn/start`. Cover the normal MCP startup notification burst, exact plugin/server id and digest, catalog/version drift, pagination bounds/deadline, success, MCP error, generic RPC ambiguity, timeout, cancellation, transport loss, malformed MCP content, and cleanup failure.
 
-**GREEN:** Implement a fresh UDS connection and thread per call, exact catalog/tool-schema digest attestation, one direct tool call, and deletion in `finally`. Mark the call ambiguous once its request frame is accepted and prohibit retry thereafter. The generated protocol does not provide an authenticated pre-execution overload shape, so this implementation conservatively performs no automatic retry; any future bounded retry must first prove that explicit pre-execution signal while retaining the lease.
+**GREEN:** Implement a fresh UDS connection and temporary persisted thread per call, exact catalog/tool-schema digest attestation, one direct tool call, and hard deletion in `finally`. The broker discards validated notifications rather than accumulating an unread queue; ordinary model-runtime clients retain their bounded queue. Mark the call ambiguous once its request frame is accepted and prohibit retry thereafter. The generated protocol does not provide an authenticated pre-execution overload shape, so this implementation conservatively performs no automatic retry; any future bounded retry must first prove that explicit pre-execution signal while retaining the lease.
 
 **Protocol evidence adjustment:** The generated
 `0.149.0-alpha.4.3` `ListMcpServerStatusResponse` schema contains no
@@ -110,7 +110,7 @@ tool call supplies operational proof; no nonexistent field is synthesized.
 **RED/GREEN cases:**
 - One serialized broker call across aliases under the existing account-global flock.
 - Stale-flock recovery without granting an ordinary alias the reserved identity.
-- Success/error/timeout/cancel always delete the ephemeral thread.
+- Success/error/timeout/cancel always hard-delete the temporary persisted thread.
 - Reload/shutdown publish exactly ten tools with zero eager broker work.
 - Ordinary aliases never gain the reserved identity or shared capability lock.
 - No replay after an ambiguous accepted frame; there is no automatic retry.

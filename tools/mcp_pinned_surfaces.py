@@ -23,8 +23,16 @@ CODEX_CUA_TOOL_NAMES = (
 )
 CODEX_CUA_APP_SERVER_NAME = "computer-use"
 CODEX_CUA_APP_SERVER_PLUGIN_ID = "computer-use@openai-bundled"
+CODEX_CUA_APP_SERVER_INFO = {
+    "description": None,
+    "icons": None,
+    "name": "Computer Use",
+    "title": None,
+    "version": "14e7d17f1f59e77ca541a15071e980628cd08977a4dda111c96e0564d337056b",
+    "websiteUrl": None,
+}
 # Canonical digest over the full thread-scoped App Server inventory below.
-CODEX_CUA_APP_SERVER_CATALOG_SHA256 = "f710c1eacba2487b5547ddafe8aeb616268850ea4501df3a4a047552a1608a40"
+CODEX_CUA_APP_SERVER_CATALOG_SHA256 = "bc4f6aca3e12fecaa3d7eee6c800f7885790c3cdebe27b84e2e1ca5d3a020c38"
 
 
 class PinnedSurface(NamedTuple):
@@ -148,9 +156,16 @@ def expected_app_server_tools() -> dict[str, dict]:
 
     tools = {}
     for template in _CODEX_CUA_TOOLS:
+        description = template["description"].rstrip()
+        if not description.endswith("."):
+            description += "."
         tools[template["name"]] = {
             "name": template["name"],
-            "description": template["description"],
+            # App Server decorates tools contributed by a plugin with this
+            # exact ownership suffix. The host-published Hermes descriptions
+            # above remain unchanged; only the live inventory attestation
+            # includes App Server's generated representation.
+            "description": description + " This tool is part of plugin `Computer Use`.",
             "inputSchema": deepcopy(template["inputSchema"]),
             "annotations": deepcopy(template["annotations"]),
             "title": None,
@@ -184,10 +199,7 @@ def canonical_app_server_catalog(row: object) -> bytes:
         or row.get("resourceTemplates") != []
     ):
         raise ValueError("Computer Use catalog identity or status drifted")
-    # The attested 0.149 row has no serverInfo. Accepting an arbitrary future
-    # identity here without hashing it would make identity/version drift
-    # invisible, so require the current generated value exactly.
-    if row.get("serverInfo") is not None:
+    if row.get("serverInfo") != CODEX_CUA_APP_SERVER_INFO:
         raise ValueError("Computer Use serverInfo identity drifted")
     raw_tools = row.get("tools")
     expected = expected_app_server_tools()
@@ -216,6 +228,7 @@ def canonical_app_server_catalog(row: object) -> bytes:
         "pluginId": CODEX_CUA_APP_SERVER_PLUGIN_ID,
         "resourceTemplates": [],
         "resources": [],
+        "serverInfo": deepcopy(CODEX_CUA_APP_SERVER_INFO),
         "tools": normalized_tools,
     }
     return json.dumps(

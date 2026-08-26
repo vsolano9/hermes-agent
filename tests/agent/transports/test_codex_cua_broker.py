@@ -13,7 +13,10 @@ import uuid
 import pytest
 from websockets.sync.server import unix_serve
 
-from agent.transports.codex_app_server import CodexAppServerTransportError
+from agent.transports.codex_app_server import (
+    CodexAppServerError,
+    CodexAppServerTransportError,
+)
 from tools.mcp_pinned_surfaces import CODEX_CUA_TOOL_NAMES, expected_app_server_tools
 
 
@@ -24,6 +27,16 @@ def _catalog_row() -> dict:
         "authStatus": "unsupported",
         "resourceTemplates": [],
         "resources": [],
+        "serverInfo": {
+            "description": None,
+            "icons": None,
+            "name": "Computer Use",
+            "title": None,
+            "version": (
+                "14e7d17f1f59e77ca541a15071e980628cd08977a4dda111c96e0564d337056b"
+            ),
+            "websiteUrl": None,
+        },
         "tools": expected_app_server_tools(),
     }
 
@@ -57,7 +70,11 @@ class FakeClient:
         params = params or {}
         self.requests.append((method, params))
         if method == "thread/start":
-            return {"thread": {"id": "thread-1", "ephemeral": True, "path": None}}
+            return {"thread": {
+                "id": "thread-1",
+                "ephemeral": False,
+                "path": "/tmp/rollout-thread-1.jsonl",
+            }}
         if method == "mcpServerStatus/list":
             return {"data": self.catalog, "nextCursor": None}
         if method == "mcpServer/tool/call":
@@ -124,7 +141,7 @@ def test_model_free_call_attests_then_calls_and_always_deletes_thread() -> None:
         "mcpServer/tool/call",
         "thread/delete",
     ]
-    assert client.requests[0][1] == {"cwd": "/tmp", "ephemeral": True}
+    assert client.requests[0][1] == {"cwd": "/tmp", "ephemeral": False}
     assert client.requests[1][1]["threadId"] == "thread-1"
     assert client.requests[1][1]["detail"] == "full"
     assert client.requests[2][1] == {
@@ -154,10 +171,7 @@ def test_catalog_plugin_or_tool_drift_fails_before_tool_call() -> None:
     unknown_status["runtimeStatus"] = "connected"
     cases.append([unknown_status])
     changed_server_identity = _catalog_row()
-    changed_server_identity["serverInfo"] = {
-        "name": "computer-use",
-        "version": "future",
-    }
+    changed_server_identity["serverInfo"]["version"] = "future"
     cases.append([changed_server_identity])
     duplicate_plugin = _catalog_row()
     duplicate_plugin["name"] = "attacker-alias"
@@ -348,6 +362,40 @@ def test_cleanup_failure_cannot_hide_a_known_completed_result() -> None:
     assert client.closed is True
 
 
+def test_persisted_control_thread_delete_failure_is_visible_but_does_not_mask_result(
+    caplog,
+) -> None:
+    client = FakeClient(delete_failure=CodexAppServerError(
+        code=-32600,
+        message="thread is not persisted and cannot be deleted: thread-1",
+    ))
+
+    result = _broker(client).call("list_apps", {}, timeout=2.0)
+
+    assert result["structuredContent"] == {"windows": []}
+    assert client.closed is True
+    assert "thread deletion failed" in caplog.text
+    assert "not persisted and cannot be deleted" in caplog.text
+
+
+def test_predispatch_failure_and_hard_delete_failure_are_both_visible(caplog) -> None:
+    from agent.transports.codex_cua_broker import CodexCUACatalogDrift
+
+    drifted = _catalog_row()
+    drifted["pluginId"] = "computer-use@drifted"
+    client = FakeClient(
+        catalog=[drifted],
+        delete_failure=CodexAppServerError(-32001, "hard delete failed"),
+    )
+
+    with pytest.raises(CodexCUACatalogDrift):
+        _broker(client).call("list_apps", {}, timeout=2.0)
+
+    assert client.closed is True
+    assert "thread deletion failed" in caplog.text
+    assert "hard delete failed" in caplog.text
+
+
 def test_connection_close_failure_cannot_hide_a_known_completed_result() -> None:
     client = FakeClient(close_failure=RuntimeError("close failed"))
 
@@ -422,6 +470,34 @@ def test_broker_authenticates_managed_peer_without_launcher_version_equality(
 
     assert result["structuredContent"] == {"windows": []}
     assert captured[0][1] == managed
+
+
+def test_default_broker_client_uses_validated_notification_sink(monkeypatch) -> None:
+    from agent.transports import codex_cua_broker as broker_module
+    from agent.transports.codex_cua_broker import CodexCUABroker, VerifiedCodex
+
+    captured = {}
+
+    class FakeConnection:
+        def __init__(self, socket_path, **kwargs):
+            captured["connection"] = (socket_path, kwargs)
+
+    class CapturingClient:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+
+    monkeypatch.setattr(
+        broker_module, "UnixWebSocketCodexAppServerConnection", FakeConnection
+    )
+    monkeypatch.setattr(broker_module, "CodexAppServerClient", CapturingClient)
+    verified = VerifiedCodex("/managed/codex", "0.149.0-alpha.4.3", ())
+
+    CodexCUABroker._make_client("/tmp/control.sock", verified, 3.0)
+
+    assert captured["connection"][0] == "/tmp/control.sock"
+    assert captured["client"]["reject_server_requests"] is True
+    assert captured["client"]["discard_notifications"] is True
+    assert captured["client"]["event_queue_limit"] == 4
 
 
 def test_malformed_initialize_thread_and_catalog_envelopes_fail_closed() -> None:
@@ -540,10 +616,19 @@ def test_full_broker_sequence_over_real_local_uds_rejects_server_requests() -> N
                 websocket.send(json.dumps({
                     "id": message["id"],
                     "result": {
-                        "thread": {"id": "thread-uds", "ephemeral": True, "path": None}
+                        "thread": {
+                            "id": "thread-uds",
+                            "ephemeral": False,
+                            "path": "/tmp/rollout-thread-uds.jsonl",
+                        }
                     },
                 }))
             elif method == "mcpServerStatus/list":
+                for index in range(32):
+                    websocket.send(json.dumps({
+                        "method": "mcpServer/startupStatus/updated",
+                        "params": {"n": index},
+                    }))
                 websocket.send(json.dumps({
                     "id": 701,
                     "method": "mcpServer/elicitation/request",
@@ -594,6 +679,7 @@ def test_full_broker_sequence_over_real_local_uds_rejects_server_requests() -> N
                     endpoint, open_timeout=open_timeout
                 ),
                 reject_server_requests=True,
+                discard_notifications=True,
                 event_queue_limit=4,
             ),
             cwd="/tmp",

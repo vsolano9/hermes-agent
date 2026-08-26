@@ -1,7 +1,8 @@
 """Model-free broker for the signed Codex Computer Use MCP surface.
 
 This module deliberately never starts an App Server turn. It creates one
-ephemeral thread only to scope Codex's maintained MCP status/call methods.
+temporary persisted thread only to scope Codex's maintained MCP status/call
+methods, then hard-deletes that thread before closing the connection.
 """
 
 from __future__ import annotations
@@ -701,6 +702,10 @@ class CodexCUABroker:
                 peer_validator=lambda peer: _validate_codex_peer(peer, verified),
             ),
             reject_server_requests=True,
+            # A model-free call has no event consumer, while MCP startup emits
+            # dozens of status notifications before the catalog response.
+            # The transport still validates every frame and method first.
+            discard_notifications=True,
             event_queue_limit=4,
         )
 
@@ -747,7 +752,7 @@ class CodexCUABroker:
                 raise CodexCUAVersionMismatch("connected App Server version differs")
             started = client.request(
                 "thread/start",
-                {"cwd": self._cwd, "ephemeral": True},
+                {"cwd": self._cwd, "ephemeral": False},
                 timeout=self._remaining(deadline, "thread/start"),
             )
             if not isinstance(started, dict):
@@ -759,10 +764,13 @@ class CodexCUABroker:
             if (
                 not isinstance(thread_id, str)
                 or not thread_id
-                or thread.get("ephemeral") is not True
-                or thread.get("path") is not None
+                or thread.get("ephemeral") is not False
+                or not isinstance(thread.get("path"), str)
+                or not thread.get("path")
             ):
-                raise CodexCUAProtocolError("App Server did not create an ephemeral thread")
+                raise CodexCUAProtocolError(
+                    "App Server did not create a deletable persisted control thread"
+                )
             self._attest_catalog(client, thread_id, deadline)
             try:
                 result = client.request(
@@ -843,7 +851,7 @@ class CodexCUABroker:
                 # Never hide a known result or primary exception: presenting
                 # cleanup loss as the call result can induce duplicate writes.
                 logger.warning(
-                    "Ephemeral Codex App Server thread deletion failed: %s",
+                    "Temporary Codex App Server thread deletion failed: %s",
                     cleanup_error,
                 )
 

@@ -218,7 +218,7 @@ def test_codex_cua_adapter_identity_makes_server_aliases_share_lock(
         mcp_tool, "_machine_account_home_for_lock", lambda: tmp_path
     )
     compatibility = {
-        "app_server_catalog_sha256": "f710c1eacba2487b5547ddafe8aeb616268850ea4501df3a4a047552a1608a40",
+        "app_server_catalog_sha256": "bc4f6aca3e12fecaa3d7eee6c800f7885790c3cdebe27b84e2e1ca5d3a020c38",
         "tools_sha256": "dd485a140f5fbebe14147fb3ee2ed3914618b3484964efe02262b2479b322f1d",
         "capabilities_sha256": "52aa21370a62916d63adb5718fa1be519ec0fe4390136bf36e701be54e5582a5",
         "tool_count": 10,

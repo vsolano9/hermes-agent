@@ -33,7 +33,7 @@ def _config() -> dict:
         "minimal_env": True,
         "supports_parallel_tool_calls": False,
         "compatibility": {
-            "app_server_catalog_sha256": "f710c1eacba2487b5547ddafe8aeb616268850ea4501df3a4a047552a1608a40",
+            "app_server_catalog_sha256": "bc4f6aca3e12fecaa3d7eee6c800f7885790c3cdebe27b84e2e1ca5d3a020c38",
             "tools_sha256": TOOLS_SHA256,
             "capabilities_sha256": CAPABILITIES_SHA256,
             "tool_count": 10,
