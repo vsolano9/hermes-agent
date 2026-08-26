@@ -62,6 +62,36 @@ def _make_mock_server(name, session=None, tools=None):
     return server
 
 
+class TestStdioChildLiveness:
+    @pytest.mark.parametrize(
+        ("tracked", "alive", "expected_dead"),
+        [
+            (set(), set(), False),
+            ({101}, {101}, False),
+            ({101}, set(), True),
+            ({101, 102}, {102}, False),
+            ({101, 102}, set(), True),
+        ],
+    )
+    def test_dead_only_when_every_tracked_child_exited(
+        self, tracked, alive, expected_dead,
+    ):
+        server = _make_mock_server("stdio-liveness")
+        server._config = {"command": "server"}
+        server._stdio_child_pids = tracked
+
+        with patch("psutil.pid_exists", side_effect=lambda pid: pid in alive):
+            assert server._stdio_children_dead() is expected_dead
+
+    def test_http_transport_is_not_classified_by_stdio_pids(self):
+        server = _make_mock_server("http-liveness")
+        server._config = {"url": "https://example.test/mcp"}
+        server._stdio_child_pids = {101}
+
+        with patch("psutil.pid_exists", return_value=False):
+            assert server._stdio_children_dead() is False
+
+
 class TestFilterMCPChildren:
     def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
         """Non-MCP children start with an interpreter/binary, not the marker."""
@@ -575,6 +605,56 @@ class TestToolHandler:
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
             _servers.pop("test_srv", None)
+
+    def test_alive_stdio_watchdog_reaches_runtime_session_call(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("apps", is_error=False)
+        )
+        server = _make_mock_server("live_stdio", session=mock_session)
+        server._config = {"command": "server"}
+        server._stdio_child_pids = {4242}
+        _servers["live_stdio"] = server
+
+        try:
+            handler = _make_tool_handler("live_stdio", "list_apps", 30)
+            with patch("psutil.pid_exists", return_value=True), \
+                 patch("tools.mcp_tool._trust_gate_check", return_value=None), \
+                 self._patch_mcp_loop():
+                result = json.loads(handler({}))
+
+            assert result["result"] == "apps"
+            mock_session.call_tool.assert_awaited_once_with(
+                "list_apps", arguments={}
+            )
+        finally:
+            _servers.pop("live_stdio", None)
+
+    def test_dead_stdio_watchdog_keeps_runtime_fast_fail(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("unexpected", is_error=False)
+        )
+        server = _make_mock_server("dead_stdio", session=mock_session)
+        server._config = {"command": "server"}
+        server._stdio_child_pids = {4343}
+        _servers["dead_stdio"] = server
+
+        try:
+            handler = _make_tool_handler("dead_stdio", "list_apps", 30)
+            with patch("psutil.pid_exists", return_value=False), \
+                 patch("tools.mcp_tool._trust_gate_check", return_value=None), \
+                 self._patch_mcp_loop():
+                result = json.loads(handler({}))
+
+            assert "has exited" in result["error"]
+            mock_session.call_tool.assert_not_awaited()
+        finally:
+            _servers.pop("dead_stdio", None)
 
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):

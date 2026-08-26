@@ -3160,7 +3160,6 @@ class MCPServerTask:
 
             if not psutil.pid_exists(pid):
                 continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
             return False  # at least one child alive
         return True
 
