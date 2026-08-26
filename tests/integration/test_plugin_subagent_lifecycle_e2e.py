@@ -994,6 +994,11 @@ def test_isolated_host_restart_loses_inflight_native_child_and_releases_process_
             except ProcessLookupError:
                 pass
             first.wait(timeout=10)
+        if first is not None:
+            if first.stdout is not None:
+                first.stdout.close()
+            if first.stderr is not None:
+                first.stderr.close()
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=5)
