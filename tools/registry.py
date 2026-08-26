@@ -15,6 +15,7 @@ Import chain (circular-import safe):
 """
 
 import ast
+from contextlib import contextmanager
 import functools
 import importlib
 import inspect
@@ -24,7 +25,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, Iterator, List, Optional, Set
 
 from hermes_constants import hermes_home_key
 
@@ -645,6 +646,35 @@ class ToolRegistry:
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def registration_transaction(self) -> Iterator[None]:
+        """Publish a related set of registry mutations atomically.
+
+        The registry's re-entrant lock remains held for the whole context, so
+        public readers observe either the state before the transaction or its
+        complete result.  Any exception restores all registration state that
+        ``register()``, ``deregister()``, or ``register_toolset_alias()`` can
+        mutate before releasing readers.
+        """
+        with self._lock:
+            tools_before = dict(self._tools)
+            scoped_tools_before = {
+                scope: dict(entries)
+                for scope, entries in self._scoped_tools.items()
+            }
+            checks_before = dict(self._toolset_checks)
+            aliases_before = dict(self._toolset_aliases)
+            generation_before = self._generation
+            try:
+                yield
+            except BaseException:
+                self._tools = tools_before
+                self._scoped_tools = scoped_tools_before
+                self._toolset_checks = checks_before
+                self._toolset_aliases = aliases_before
+                self._generation = generation_before
+                raise
 
     def register_plugin_override_policy(
         self,

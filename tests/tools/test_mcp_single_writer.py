@@ -192,7 +192,26 @@ def test_malformed_scalar_single_writer_rejects_server_fail_closed():
     assert "invalid single_writer" in mcp_tool._server_connect_errors["desktop"]
 
 
-def test_codex_cua_compatibility_identity_makes_server_aliases_share_lock(
+def test_writer_lock_missing_capability_key_fails_closed_without_identity_lookup(
+    monkeypatch,
+):
+    mcp_tool._single_writer_policies["missing-key"] = (90.0, 0.0)
+    monkeypatch.setattr(
+        mcp_tool,
+        "_mcp_capability_identity",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("writer condition must not re-enter MCP state")
+        ),
+    )
+
+    assert not mcp_tool._acquire_single_writer_lease(
+        "missing-key", "owner", wait_timeout_seconds=0
+    )
+    assert "missing-key" not in mcp_tool._single_writer_leases
+    assert "missing-key" not in mcp_tool._single_writer_process_locks
+
+
+def test_codex_cua_launcher_identity_makes_server_aliases_share_lock(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -204,17 +223,31 @@ def test_codex_cua_compatibility_identity_makes_server_aliases_share_lock(
         "tool_count": 10,
         "tools_only": True,
     }
+    launcher = str(
+        Path(mcp_tool.__file__).resolve().parents[1]
+        / "optional-mcps" / "codex-computer-use" / "launcher.py"
+    )
+    tools = {
+        "include": [
+            "list_apps", "get_app_state", "click", "perform_secondary_action",
+            "set_value", "select_text", "scroll", "drag", "press_key", "type_text",
+        ],
+        "resources": False,
+        "prompts": False,
+    }
+    cua_config = {
+        "enabled": False,
+        "command": launcher,
+        "single_writer": True,
+        "supports_parallel_tool_calls": False,
+        "minimal_env": True,
+        "trust": "untrusted",
+        "compatibility": compatibility,
+        "tools": tools,
+    }
     mcp_tool.register_mcp_servers({
-        "codex-computer-use": {
-            "enabled": False,
-            "single_writer": True,
-            "compatibility": compatibility,
-        },
-        "renamed-local-cua": {
-            "enabled": False,
-            "single_writer": True,
-            "compatibility": compatibility,
-        },
+        "codex-computer-use": dict(cua_config),
+        "renamed-local-cua": dict(cua_config),
     })
 
     assert mcp_tool._single_writer_capability_keys["codex-computer-use"] == (

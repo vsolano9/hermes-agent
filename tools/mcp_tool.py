@@ -111,7 +111,7 @@ import shutil
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -120,6 +120,11 @@ from urllib.parse import urlparse
 
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
+from tools.mcp_pinned_surfaces import (
+    CODEX_CUA_CAPABILITIES_SHA256 as _CODEX_CUA_CAPABILITIES_SHA256,
+    CODEX_CUA_TOOLS_SHA256 as _CODEX_CUA_TOOLS_SHA256,
+    CODEX_CUA_TOOL_NAMES as _CODEX_CUA_TOOL_NAMES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -4066,6 +4071,14 @@ class MCPServerTask:
         registry-owned before its first successful session, so ownership also
         authorizes its first publication.
         """
+        # A host-pinned lazy server uses live discovery only as evidence.  Its
+        # process-lifetime handlers come from checked-in definitions and a
+        # reconnect must never replace them with server-supplied objects.
+        with _lock:
+            if self.name in _pinned_lazy_server_configs:
+                if _servers.get(self.name) is self:
+                    _server_connect_errors.pop(self.name, None)
+                return
         if self._registered_tool_names:
             with _lock:
                 if _servers.get(self.name) is self:
@@ -4637,6 +4650,11 @@ _server_connect_errors: Dict[str, str] = {}
 _lazy_server_configs: Dict[str, dict] = {}
 _lazy_server_fingerprints: Dict[str, str] = {}
 _lazy_server_tool_names: Dict[str, List[str]] = {}
+# Host-pinned lazy servers are distinct from schema-cache lazy servers.  Their
+# model-visible definitions come from checked-in code, remain registered for
+# the process lifetime, and every turn gets a fresh validated live session.
+_pinned_lazy_server_configs: Dict[str, dict] = {}
+_pinned_lazy_server_tool_names: Dict[str, List[str]] = {}
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -4756,6 +4774,51 @@ _TRUST_UNTRUSTED = "untrusted"
 _mcp_routine_grants_lock = threading.Lock()
 _mcp_routine_grants: Dict[str, dict] = {}
 _mcp_state_observations: Dict[Tuple[str, str, str], dict] = {}
+_mcp_server_capability_identities: Dict[str, str] = {}
+_CODEX_CUA_CAPABILITY_IDENTITY = "openai-codex-cua"
+
+
+def _ordinary_mcp_capability_identity(server_name: str) -> str:
+    """Domain-separate caller-controlled names from reserved capabilities."""
+
+    return f"mcp-server:{server_name}"
+
+
+def _codex_cua_launcher_path() -> str:
+    return os.path.realpath(os.path.join(
+        os.path.dirname(__file__), "..", "optional-mcps",
+        "codex-computer-use", "launcher.py",
+    ))
+
+
+def _is_canonical_codex_cua_launcher(config: Optional[dict]) -> bool:
+    command = (config or {}).get("command")
+    return (
+        isinstance(command, str)
+        and os.path.realpath(command) == _codex_cua_launcher_path()
+    )
+
+
+def _remember_mcp_capability_identity(server_name: str, config: dict) -> str:
+    identity = (
+        _CODEX_CUA_CAPABILITY_IDENTITY
+        if _is_canonical_codex_cua_launcher(config)
+        else _ordinary_mcp_capability_identity(server_name)
+    )
+    with _lock:
+        _mcp_server_capability_identities[server_name] = identity
+    return identity
+
+
+def _mcp_capability_identity(server_name: str) -> str:
+    with _lock:
+        return _mcp_server_capability_identities.get(
+            server_name, _ordinary_mcp_capability_identity(server_name)
+        )
+
+
+def _is_codex_cua_identity(server_name: str) -> bool:
+    return _mcp_capability_identity(server_name) == _CODEX_CUA_CAPABILITY_IDENTITY
 
 
 def _canonical_action_arguments(arguments: Any) -> bytes:
@@ -4790,6 +4853,7 @@ def _record_mcp_state_observation(
     digest = str(state_digest or "").strip().lower()
     if not owner or not server or not normalized_app or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError("Invalid MCP state observation")
+    server = _mcp_capability_identity(server)
     with _mcp_routine_grants_lock:
         _mcp_state_observations[(owner, server, normalized_app)] = {
             "digest": digest,
@@ -4816,7 +4880,7 @@ def _record_state_result_for_exact_grant(
     """
 
     if (
-        server_name not in {"codex-computer-use", "openai-codex-cua"}
+        not _is_codex_cua_identity(server_name)
         or tool_name != "get_app_state"
         or not str(task_id or "").strip()
     ):
@@ -4895,6 +4959,7 @@ def _issue_mcp_exact_action_grant(
         or not (1 <= ttl <= 60)
     ):
         raise ValueError("Invalid exact MCP action grant")
+    server = _mcp_capability_identity(server)
     args_hash = hashlib.sha256(_canonical_action_arguments(arguments)).hexdigest()
     with _mcp_routine_grants_lock:
         _mcp_routine_grants[owner] = {
@@ -4917,6 +4982,7 @@ def _consume_mcp_exact_action_grant(
     monotonic=time.monotonic,
 ) -> bool:
     owner = str(task_id or "").strip()
+    server_identity = _mcp_capability_identity(server_name)
     app = str((args or {}).get("app") or "").strip().casefold()
     if not owner or not app:
         return False
@@ -4928,10 +4994,10 @@ def _consume_mcp_exact_action_grant(
         return False
     with _mcp_routine_grants_lock:
         grant = _mcp_routine_grants.get(owner)
-        observation = _mcp_state_observations.get((owner, server_name, app))
+        observation = _mcp_state_observations.get((owner, server_identity, app))
         if (
             not grant
-            or grant["server"] != server_name
+            or grant["server"] != server_identity
             or grant["app"] != app
             or grant["tool"] != tool_name
             or grant["args_hash"] != args_hash
@@ -5615,27 +5681,14 @@ _single_writer_leases: Dict[str, Tuple[str, float]] = {}
 _single_writer_process_locks: Dict[str, Tuple[str, Any]] = {}
 _single_writer_capability_keys: Dict[str, str] = {}
 
-_CODEX_CUA_TOOLS_SHA256 = (
-    "dd485a140f5fbebe14147fb3ee2ed3914618b3484964efe02262b2479b322f1d"
-)
-_CODEX_CUA_CAPABILITIES_SHA256 = (
-    "52aa21370a62916d63adb5718fa1be519ec0fe4390136bf36e701be54e5582a5"
-)
-
-
 def _single_writer_capability_key(server_name: str, config: Optional[dict] = None) -> str:
-    compatibility = (config or {}).get("compatibility")
-    if (
-        isinstance(compatibility, dict)
-        and compatibility.get("tools_sha256") == _CODEX_CUA_TOOLS_SHA256
-        and compatibility.get("capabilities_sha256")
-        == _CODEX_CUA_CAPABILITIES_SHA256
-    ):
-        return "openai-codex-cua"
-    normalized = re.sub(r"[^a-z0-9]+", "-", server_name.casefold()).strip("-")
-    if normalized in {"codex-computer-use", "openai-codex-cua"}:
-        return "openai-codex-cua"
-    return f"mcp-server:{server_name}"
+    if config is not None:
+        if _is_canonical_codex_cua_launcher(config):
+            return _CODEX_CUA_CAPABILITY_IDENTITY
+        return _ordinary_mcp_capability_identity(server_name)
+    if _mcp_capability_identity(server_name) == _CODEX_CUA_CAPABILITY_IDENTITY:
+        return _CODEX_CUA_CAPABILITY_IDENTITY
+    return _ordinary_mcp_capability_identity(server_name)
 
 
 def _machine_account_home_for_lock():
@@ -5669,9 +5722,9 @@ def _try_acquire_single_writer_process_lock(server_name: str) -> Any:
                 or stat.S_IMODE(info.st_mode) & 0o077
             ):
                 raise PermissionError("unsafe machine-global MCP lock directory")
-        capability_key = _single_writer_capability_keys.get(
-            server_name, _single_writer_capability_key(server_name)
-        )
+        capability_key = _single_writer_capability_keys.get(server_name)
+        if not isinstance(capability_key, str) or not capability_key:
+            raise RuntimeError("single-writer capability key is missing")
         digest = hashlib.sha256(capability_key.encode("utf-8")).hexdigest()
         flags = os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
@@ -5711,12 +5764,16 @@ def _configure_single_writer_server(
 ) -> None:
     idle = max(1.0, min(float(idle_timeout_seconds), 3600.0))
     wait = max(0.0, min(float(wait_timeout_seconds), 60.0))
+    # Resolve identity before taking the writer condition. The global lock
+    # order is MCP state -> writer condition; reversing it can deadlock a
+    # concurrent coordinated pinned publication.
+    resolved_capability_key = (
+        capability_key or _single_writer_capability_key(server_name)
+    )
     with _single_writer_condition:
         if enabled:
             _single_writer_policies[server_name] = (idle, wait)
-            _single_writer_capability_keys[server_name] = (
-                capability_key or _single_writer_capability_key(server_name)
-            )
+            _single_writer_capability_keys[server_name] = resolved_capability_key
         else:
             _single_writer_policies.pop(server_name, None)
             _single_writer_capability_keys.pop(server_name, None)
@@ -5780,12 +5837,40 @@ def release_mcp_single_writer_leases(owner_task_id: str) -> None:
             for server_name, (lease_owner, _last_used) in _single_writer_leases.items()
             if lease_owner == owner
         ]
-        for server_name in stale:
+    # A host-pinned lazy session is an ephemeral capability held by the same
+    # account-global lease.  Close it while the flock is still held: unlocking
+    # first would allow another process to create a second upstream client
+    # during teardown.  A teardown failure therefore fails closed by retaining
+    # the lease until a later cleanup attempt or process exit.
+    releasable = []
+    for server_name in stale:
+        with _lock:
+            server = (
+                _servers.get(server_name)
+                if server_name in _pinned_lazy_server_configs
+                else None
+            )
+        if server is not None:
+            try:
+                _run_on_mcp_loop(server.shutdown, timeout=15.0)
+            except Exception as exc:
+                logger.error(
+                    "MCP server '%s': refusing to release writer lock because "
+                    "ephemeral disconnect failed: %s", server_name, exc,
+                )
+                continue
+            with _lock:
+                if _servers.get(server_name) is server:
+                    _servers.pop(server_name, None)
+        releasable.append(server_name)
+
+    with _single_writer_condition:
+        for server_name in releasable:
             _single_writer_leases.pop(server_name, None)
             held = _single_writer_process_locks.pop(server_name, None)
             if held is not None:
                 held[1].release()
-        if stale:
+        if releasable:
             _single_writer_condition.notify_all()
 
 
@@ -6540,6 +6625,98 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     return server is not None and server.session is not None
 
 
+def _ensure_pinned_server_connected(server_name: str) -> bool:
+    """Create one ephemeral, live-validated session for a host-pinned server."""
+
+    with _lock:
+        server = _servers.get(server_name)
+        if server is not None and server.session is not None:
+            return True
+        config = _pinned_lazy_server_configs.get(server_name)
+        if not config:
+            return False
+        existing_task = getattr(server, "_task", None) if server is not None else None
+        existing_task_alive = (
+            existing_task is not None
+            and callable(getattr(existing_task, "done", None))
+            and not existing_task.done()
+        )
+        if existing_task_alive:
+            reconnect_existing = server
+            stale_server = None
+        else:
+            reconnect_existing = None
+            stale_server = server
+            if server_name in _server_connecting:
+                return False
+            _server_connecting.add(server_name)
+        if _connect_cooldown_active(server_name):
+            if reconnect_existing is None:
+                _server_connecting.discard(server_name)
+            return False
+        _server_connect_errors.pop(server_name, None)
+
+    connect_timeout = float(config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT))
+
+    # A parked/reconnecting MCPServerTask still owns its lifecycle coroutine.
+    # Reuse it; starting discovery here would overwrite _servers[name] while
+    # the original task can still reconnect and produce a second upstream.
+    if reconnect_existing is not None:
+        if not _signal_reconnect_and_wait(
+            server_name,
+            reconnect_existing,
+            op_description="host-pinned first-use reconnect",
+            timeout=min(connect_timeout + 10.0, 30.0),
+        ):
+            return False
+        return reconnect_existing.session is not None
+
+    # A completed/never-started task cannot revive. Fully tear it down and
+    # remove it by identity before a replacement is allowed to publish.
+    if stale_server is not None:
+        try:
+            _run_on_mcp_loop(stale_server.shutdown, timeout=15.0)
+        except Exception as exc:
+            with _lock:
+                _server_connecting.discard(server_name)
+                _server_connect_errors[server_name] = _format_connect_error(exc)
+            return False
+        with _lock:
+            current = _servers.get(server_name)
+            if current is stale_server:
+                _servers.pop(server_name, None)
+            elif current is not None:
+                _server_connecting.discard(server_name)
+                return current.session is not None
+
+    _ensure_mcp_loop()
+
+    async def _connect():
+        return await _discover_and_register_server(
+            server_name, config, publish_tools=False
+        )
+
+    try:
+        _run_on_mcp_loop(_connect, timeout=connect_timeout + 30.0)
+    except BaseException as exc:
+        message = _format_connect_error(exc)
+        with _lock:
+            _server_connecting.discard(server_name)
+            _server_connect_errors[server_name] = message
+            _record_connect_failure(server_name)
+        logger.warning(
+            "Host-pinned MCP connect/validation failed for '%s': %s",
+            server_name, message,
+        )
+        return False
+
+    with _lock:
+        _server_connecting.discard(server_name)
+        _clear_connect_failure(server_name)
+        server = _servers.get(server_name)
+    return server is not None and server.session is not None
+
+
 def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     """Return a connected server, lazily reconnecting recycled stdio state.
 
@@ -6550,6 +6727,12 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     with _lock:
         server = _servers.get(server_name)
         is_lazy = server_name in _lazy_server_configs
+        is_pinned_lazy = server_name in _pinned_lazy_server_configs
+    if is_pinned_lazy and (server is None or server.session is None):
+        _ensure_pinned_server_connected(server_name)
+        with _lock:
+            server = _servers.get(server_name)
+        return server
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
         with _lock:
@@ -6821,10 +7004,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # Bind exact-action authorization to the trusted, structured MCP
             # result before images are rendered as model-visible MEDIA: cache
             # paths. Never recover a path from tool-controlled result text.
-            if (
-                server_name in {"codex-computer-use", "openai-codex-cua"}
-                and tool_name == "get_app_state"
-            ):
+            if _is_codex_cua_identity(server_name) and tool_name == "get_app_state":
                 try:
                     trusted_state_digest["value"] = _trusted_mcp_result_sha256(result)
                 except (TypeError, ValueError):
@@ -7728,11 +7908,23 @@ def _existing_tool_names() -> List[str]:
             if sname not in _servers
             for n in tool_names
         ]
+        pinned_names = [
+            n
+            for tool_names in _pinned_lazy_server_tool_names.values()
+            for n in tool_names
+        ]
     names.extend(lazy_names)
+    names.extend(pinned_names)
     return names
 
 
-def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+def _register_server_tools(
+    name: str,
+    server: MCPServerTask,
+    config: dict,
+    *,
+    write_schema_cache: bool = True,
+) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
     Handles include/exclude filtering and utility tools. Toolset resolution
@@ -7968,6 +8160,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         # live connect so the next startup can lazily register this server
         # without spawning it. Cache failures never break registration.
         try:
+            if not write_schema_cache:
+                return registered_names
             from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
 
             tools_payload: List[dict] = []
@@ -8013,6 +8207,239 @@ class _CachedMCPTool:
         self.name = name
         self.description = description
         self.inputSchema = inputSchema or {}
+
+
+def _get_host_pinned_surface(config: dict):
+    """Classify the canonical launcher and require its literal host policy."""
+
+    from tools.mcp_pinned_surfaces import get_surface
+
+    compatibility = config.get("compatibility")
+    exact_compatibility = {
+        "tools_sha256": _CODEX_CUA_TOOLS_SHA256,
+        "capabilities_sha256": _CODEX_CUA_CAPABILITIES_SHA256,
+        "tool_count": 10,
+        "tools_only": True,
+    }
+    claims_cua_digest_pair = (
+        isinstance(compatibility, dict)
+        and compatibility.get("tools_sha256") == _CODEX_CUA_TOOLS_SHA256
+        and compatibility.get("capabilities_sha256")
+        == _CODEX_CUA_CAPABILITIES_SHA256
+    )
+    if not _is_canonical_codex_cua_launcher(config):
+        if claims_cua_digest_pair:
+            raise ValueError(
+                "the Codex CUA digest pair is reserved for the canonical "
+                "signed-launcher adapter"
+            )
+        return None
+
+    exact_tools_policy = {
+        "include": list(_CODEX_CUA_TOOL_NAMES),
+        "resources": False,
+        "prompts": False,
+    }
+    if (
+        compatibility != exact_compatibility
+        or config.get("tools") != exact_tools_policy
+        or config.get("single_writer") is not True
+        or config.get("supports_parallel_tool_calls") is not False
+        or config.get("trust") != _TRUST_UNTRUSTED
+        or config.get("minimal_env") is not True
+        or config.get("args") is not None
+        or config.get("env") not in (None, {})
+        or "url" in config
+    ):
+        raise ValueError(
+            "canonical Codex CUA launcher requires the literal pinned digest, "
+            "ten-tool allowlist, tools-only, untrusted, minimal-environment, "
+            "non-parallel single-writer policy"
+        )
+    return get_surface(_CODEX_CUA_TOOLS_SHA256, _CODEX_CUA_CAPABILITIES_SHA256)
+
+
+@contextmanager
+def _coordinated_host_pinned_registry_transaction(registry):
+    """Atomically mutate registry and host-owned pinned-policy state.
+
+    Lock order is always registry, MCP state, then writer-policy condition.
+    Readers therefore cannot obtain a pinned handler before its identity,
+    trust, provenance, and nonparallel single-writer policy exist. Exceptions
+    restore every lock domain before any partial state becomes visible.
+    """
+
+    with registry.registration_transaction():
+        with _lock, _single_writer_condition:
+            trust_before = dict(_server_trust_levels)
+            hints_before = {
+                server: dict(hints)
+                for server, hints in _tool_read_only_hints.items()
+            }
+            provenance_before = dict(_mcp_tool_server_names)
+            identities_before = dict(_mcp_server_capability_identities)
+            parallel_before = set(_parallel_safe_servers)
+            writer_policies_before = dict(_single_writer_policies)
+            writer_keys_before = dict(_single_writer_capability_keys)
+            writer_leases_before = dict(_single_writer_leases)
+            writer_locks_before = dict(_single_writer_process_locks)
+            configs_before = {
+                server: dict(server_config)
+                for server, server_config in _pinned_lazy_server_configs.items()
+            }
+            names_before = {
+                server: list(tool_names)
+                for server, tool_names in _pinned_lazy_server_tool_names.items()
+            }
+            try:
+                yield
+            except BaseException:
+                _server_trust_levels.clear()
+                _server_trust_levels.update(trust_before)
+                _tool_read_only_hints.clear()
+                _tool_read_only_hints.update(hints_before)
+                _mcp_tool_server_names.clear()
+                _mcp_tool_server_names.update(provenance_before)
+                _mcp_server_capability_identities.clear()
+                _mcp_server_capability_identities.update(identities_before)
+                _parallel_safe_servers.clear()
+                _parallel_safe_servers.update(parallel_before)
+                _single_writer_policies.clear()
+                _single_writer_policies.update(writer_policies_before)
+                _single_writer_capability_keys.clear()
+                _single_writer_capability_keys.update(writer_keys_before)
+                _single_writer_leases.clear()
+                _single_writer_leases.update(writer_leases_before)
+                _single_writer_process_locks.clear()
+                _single_writer_process_locks.update(writer_locks_before)
+                _pinned_lazy_server_configs.clear()
+                _pinned_lazy_server_configs.update(configs_before)
+                _pinned_lazy_server_tool_names.clear()
+                _pinned_lazy_server_tool_names.update(names_before)
+                raise
+
+
+def _register_from_host_pinned_surface_sync(
+    name: str, config: dict, surface: Any
+) -> List[str]:
+    """Atomically publish the complete checked-in contract or no handlers."""
+
+    from tools.registry import registry
+
+    _validate_mcp_surface(name, surface.tools, surface.capabilities, config)
+    toolset_name = f"mcp-{name}"
+    tool_timeout = _resolve_tool_timeout(config)
+    check_fn = _make_check_fn(name)
+    candidates = []
+    for tool in surface.tools:
+        _scan_mcp_description(name, tool.name, tool.description or "")
+        schema = _convert_mcp_schema(name, tool)
+        candidates.append((
+            schema["name"],
+            schema,
+            _make_tool_handler(name, tool.name, tool_timeout),
+        ))
+
+    expected_names = {
+        mcp_prefixed_tool_name(name, raw_name)
+        for raw_name in _CODEX_CUA_TOOL_NAMES
+    }
+    candidate_names = {candidate[0] for candidate in candidates}
+    if len(candidates) != 10 or candidate_names != expected_names:
+        raise ValueError("checked-in Codex CUA registration set is not exact")
+
+    published: List[Tuple[str, Any]] = []
+    with _coordinated_host_pinned_registry_transaction(registry):
+        alias_target = registry.get_toolset_alias_target(name)
+        if alias_target is not None and alias_target != toolset_name:
+            raise ValueError(
+                f"Codex CUA toolset alias '{name}' is already occupied"
+            )
+        occupied = [
+            tool_name for tool_name in sorted(expected_names)
+            if registry.get_entry(tool_name) is not None
+        ]
+        if occupied:
+            raise ValueError(
+                "Codex CUA atomic registration collided with existing tool(s): "
+                + ", ".join(occupied)
+            )
+
+        for tool_name, schema, handler in candidates:
+            registry.register(
+                name=tool_name,
+                toolset=toolset_name,
+                schema=schema,
+                handler=handler,
+                check_fn=check_fn,
+                is_async=False,
+                description=schema["description"],
+            )
+            entry = registry.get_entry(tool_name)
+            if (
+                entry is None
+                or entry.toolset != toolset_name
+                or entry.handler is not handler
+            ):
+                raise ValueError(
+                    f"Codex CUA registry rejected pinned handler '{tool_name}'"
+                )
+            published.append((tool_name, handler))
+
+        if {name for name, _handler in published} != expected_names:
+            raise ValueError("Codex CUA registry accepted a non-exact subset")
+        registry.register_toolset_alias(name, toolset_name)
+        if registry.get_toolset_alias_target(name) != toolset_name:
+            raise ValueError("Codex CUA toolset alias registration was rejected")
+
+        # Keep the call-time security policy and connection routing behind the
+        # same publication boundary as the handlers. A registry reader must
+        # never obtain a write-capable handler while its trust metadata still
+        # has the legacy full-trust default or before pinned lazy routing is
+        # installed.
+        ordered_names = [candidate[0] for candidate in candidates]
+        expected_hints = {
+            tool.name: _annotation_read_only_hint(tool)
+            for tool in surface.tools
+        }
+        _server_trust_levels[name] = _normalize_server_trust(config.get("trust"))
+        _tool_read_only_hints[name] = expected_hints
+        _mcp_server_capability_identities[name] = _CODEX_CUA_CAPABILITY_IDENTITY
+        _parallel_safe_servers.discard(name)
+        _single_writer_policies[name] = (90.0, 10.0)
+        _single_writer_capability_keys[name] = _CODEX_CUA_CAPABILITY_IDENTITY
+        for tool_name, _handler in published:
+            _mcp_tool_server_names[tool_name] = name
+        _pinned_lazy_server_configs[name] = dict(config)
+        _pinned_lazy_server_tool_names[name] = ordered_names
+
+        # Validate the registry and every security-sensitive companion map
+        # immediately before the coordinated transaction releases readers.
+        if (
+            registry.get_tool_names_for_toolset(toolset_name)
+            != sorted(expected_names)
+            or registry.get_toolset_alias_target(name) != toolset_name
+            or _server_trust_levels.get(name) != _TRUST_UNTRUSTED
+            or _tool_read_only_hints.get(name) != expected_hints
+            or _mcp_server_capability_identities.get(name)
+            != _CODEX_CUA_CAPABILITY_IDENTITY
+            or name in _parallel_safe_servers
+            or _single_writer_policies.get(name) != (90.0, 10.0)
+            or _single_writer_capability_keys.get(name)
+            != _CODEX_CUA_CAPABILITY_IDENTITY
+            or name in _single_writer_leases
+            or name in _single_writer_process_locks
+            or _pinned_lazy_server_configs.get(name) != dict(config)
+            or _pinned_lazy_server_tool_names.get(name) != ordered_names
+            or any(
+                _mcp_tool_server_names.get(tool_name) != name
+                for tool_name in expected_names
+            )
+        ):
+            raise ValueError(
+                "Codex CUA coordinated publication state is not exact"
+            )
+    return ordered_names
 
 
 def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]:
@@ -8153,7 +8580,9 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         )
     return registered_names
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+async def _discover_and_register_server(
+    name: str, config: dict, *, publish_tools: bool = True
+) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
@@ -8214,8 +8643,15 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _server_connect_errors.pop(name, None)
         _servers[name] = server
 
-    registered_names = _register_server_tools(name, server, config)
-    server._registered_tool_names = list(registered_names)
+    if publish_tools:
+        registered_names = _register_server_tools(name, server, config)
+        server._registered_tool_names = list(registered_names)
+    else:
+        # Host-pinned lazy registration already owns the model-visible
+        # handlers.  The live server is evidence and transport only; never let
+        # it replace those handlers, even after an exact validation.
+        registered_names = []
+        server._registered_tool_names = []
 
     transport_type = "HTTP" if "url" in config else "stdio"
     logger.info(
@@ -8251,6 +8687,41 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
 
+    # Classify the checked-in launcher before any eager/lazy routing.  Its
+    # identity is authoritative even when the manifest policy is missing or
+    # malformed, so policy drift is rejected instead of falling through to
+    # the ordinary eager connector.  Conversely, hashes alone never grant the
+    # privileged pinned path to another command.
+    pinned_surfaces: Dict[str, Any] = {}
+    accepted_servers: Dict[str, dict] = {}
+    for server_name, server_config in servers.items():
+        try:
+            pinned_surface = _get_host_pinned_surface(server_config)
+        except ValueError as exc:
+            with _lock:
+                _server_connecting.discard(server_name)
+                _server_connect_errors[server_name] = str(exc)
+            logger.error(
+                "MCP server '%s': %s; refusing registration",
+                server_name, exc,
+            )
+            continue
+        accepted_servers[server_name] = server_config
+        # Make existing pinned ownership authoritative for this whole
+        # invocation. The check and any ordinary identity write share one
+        # critical section with pinned publication.
+        with _lock:
+            already_pinned = server_name in _pinned_lazy_server_configs
+            if not already_pinned and pinned_surface is None:
+                _mcp_server_capability_identities[server_name] = (
+                    _ordinary_mcp_capability_identity(server_name)
+                )
+        if pinned_surface is not None:
+            pinned_surfaces[server_name] = pinned_surface
+    servers = accepted_servers
+    if not servers:
+        return _existing_tool_names()
+
     # Only attempt servers that aren't already connected (or currently
     # connecting) and are enabled.  Checking ``_server_connecting`` prevents
     # duplicate subprocess spawns when ``discover_mcp_tools()`` is called
@@ -8265,6 +8736,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             # Servers already lazily registered from the schema cache are
             # not re-registered; they connect on first tool use (#56832).
             and k not in _lazy_server_configs
+            and k not in _pinned_lazy_server_configs
             and _parse_boolish(v.get("enabled", True), default=True)
             # Skip a server still serving its post-failure backoff. Without
             # this, a server that fails to connect (and is therefore never
@@ -8287,8 +8759,22 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
-        # Track which servers opt-in to parallel tool calls (idempotent).
-        for srv_name, srv_cfg in servers.items():
+        # Existing pinned aliases never accept caller-provided policy changes.
+        # Enabled new pinned policy is committed with its handlers below.
+        # Disabled ordinary/pinned configs retain the historical policy-only
+        # setup used by status/configuration callers without publishing tools.
+        for srv_name, srv_cfg in list(servers.items()):
+            # Authorization must be current at the mutation point: another
+            # invocation may have committed pinned ownership after this one
+            # classified its caller-controlled config.
+            if srv_name in _pinned_lazy_server_configs:
+                continue
+            if (
+                srv_name in pinned_surfaces
+                and srv_name in new_servers
+                and _parse_boolish(srv_cfg.get("enabled", True), default=True)
+            ):
+                continue
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
                 _parallel_safe_servers.add(srv_name)
             else:
@@ -8341,13 +8827,38 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if not new_servers:
         return _existing_tool_names()
 
+    # Host-pinned lazy startup: a checked-in exact surface is safe to publish
+    # without an upstream client.  Selection is by the complete known digest
+    # pair, never by manifest-provided schemas or a writable cache.
+    pinned_registered = 0
+    for name, cfg in list(new_servers.items()):
+        surface = pinned_surfaces.get(name)
+        if surface is None:
+            continue
+        try:
+            names = _register_from_host_pinned_surface_sync(name, cfg, surface)
+        except Exception as exc:
+            logger.error(
+                "MCP server '%s': checked-in surface validation failed: %s",
+                name, exc,
+            )
+            with _lock:
+                _server_connecting.discard(name)
+                _server_connect_errors[name] = str(exc)
+            new_servers.pop(name, None)
+            continue
+        with _lock:
+            _server_connecting.discard(name)
+        new_servers.pop(name, None)
+        pinned_registered += len(names)
+
     # Lazy startup (#56832): servers gated with ``lazy: true`` whose config
     # fingerprint matches a valid on-disk schema-cache entry register their
     # tools from cache WITHOUT spawning/connecting. A missing or stale cache
     # entry falls back to the normal eager connect below (which write-through
     # refreshes the cache for next time).
     eager_servers: Dict[str, dict] = dict(new_servers)
-    lazy_registered = 0
+    lazy_registered = pinned_registered
     lazy_server_count = 0
     try:
         from tools.mcp_schema_cache import config_fingerprint, get_cached_entry
@@ -8978,14 +9489,15 @@ def shutdown_mcp_servers():
     with _lock:
         servers_snapshot = list(_servers.values())
 
-    with _single_writer_condition:
-        for _owner, cookie in _single_writer_process_locks.values():
-            cookie.release()
-        _single_writer_policies.clear()
-        _single_writer_capability_keys.clear()
-        _single_writer_leases.clear()
-        _single_writer_process_locks.clear()
-        _single_writer_condition.notify_all()
+    def _release_writer_locks_after_disconnect() -> None:
+        with _single_writer_condition:
+            for _owner, cookie in _single_writer_process_locks.values():
+                cookie.release()
+            _single_writer_policies.clear()
+            _single_writer_capability_keys.clear()
+            _single_writer_leases.clear()
+            _single_writer_process_locks.clear()
+            _single_writer_condition.notify_all()
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
@@ -8998,6 +9510,7 @@ def shutdown_mcp_servers():
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
         _stop_mcp_loop()
+        _release_writer_locks_after_disconnect()
         return
 
     async def _shutdown():
@@ -9042,6 +9555,10 @@ def shutdown_mcp_servers():
         _server_connect_failures.clear()
 
     _stop_mcp_loop()
+    # The account-global capability lock is the outermost lifetime guard.
+    # Release it only after every upstream transport has been torn down and
+    # the loop can no longer reconnect one behind our back.
+    _release_writer_locks_after_disconnect()
 
 
 def _kill_orphaned_mcp_children(

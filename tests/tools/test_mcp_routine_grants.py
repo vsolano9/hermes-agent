@@ -8,17 +8,71 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools import mcp_tool
+from tools.registry import ToolRegistry
 
 
 STATE_DIGEST = "a" * 64
 NEXT_STATE_DIGEST = "b" * 64
 ACTION_ARGS = {"app": "Google Chrome", "element_id": 42, "button": "left"}
+_TEST_CUA_ALIASES = {
+    "parent-cua-alias",
+    "child-cua-alias",
+    "state-cua-alias",
+}
+
+
+def _clear_test_alias_state() -> None:
+    for server_name in _TEST_CUA_ALIASES:
+        mcp_tool._pinned_lazy_server_configs.pop(server_name, None)
+        mcp_tool._pinned_lazy_server_tool_names.pop(server_name, None)
+        mcp_tool._mcp_server_capability_identities.pop(server_name, None)
+        mcp_tool._server_trust_levels.pop(server_name, None)
+        mcp_tool._tool_read_only_hints.pop(server_name, None)
+        mcp_tool._parallel_safe_servers.discard(server_name)
+        mcp_tool._server_connect_errors.pop(server_name, None)
+    for tool_name, server_name in list(mcp_tool._mcp_tool_server_names.items()):
+        if server_name in _TEST_CUA_ALIASES:
+            mcp_tool._mcp_tool_server_names.pop(tool_name, None)
+    mcp_tool._reset_single_writer_leases_for_tests()
+
+
+def _cua_config():
+    launcher = (
+        Path(mcp_tool.__file__).resolve().parents[1]
+        / "optional-mcps" / "codex-computer-use" / "launcher.py"
+    )
+    tools = [
+        "list_apps", "get_app_state", "click", "perform_secondary_action",
+        "set_value", "select_text", "scroll", "drag", "press_key", "type_text",
+    ]
+    return {
+        "command": str(launcher),
+        "trust": "untrusted",
+        "supports_parallel_tool_calls": False,
+        "single_writer": True,
+        "minimal_env": True,
+        "compatibility": {
+            "tools_sha256": "dd485a140f5fbebe14147fb3ee2ed3914618b3484964efe02262b2479b322f1d",
+            "capabilities_sha256": "52aa21370a62916d63adb5718fa1be519ec0fe4390136bf36e701be54e5582a5",
+            "tool_count": 10,
+            "tools_only": True,
+        },
+        "tools": {"include": tools, "resources": False, "prompts": False},
+    }
 
 
 def setup_function():
+    _clear_test_alias_state()
     mcp_tool._reset_mcp_routine_grants_for_tests()
+    mcp_tool._remember_mcp_capability_identity(
+        "codex-computer-use", _cua_config()
+    )
+    mcp_tool._remember_mcp_capability_identity(
+        "openai-codex-cua", _cua_config()
+    )
     mcp_tool._server_trust_levels["codex"] = "untrusted"
     mcp_tool._tool_read_only_hints["codex"] = {
         "get_app_state": True,
@@ -29,6 +83,7 @@ def setup_function():
 
 def teardown_function():
     mcp_tool._reset_mcp_routine_grants_for_tests()
+    _clear_test_alias_state()
 
 
 def _issue(*, task_id="child-1", app="Google Chrome", tool="click", args=None,
@@ -174,6 +229,57 @@ def test_successful_state_result_exposes_and_records_stable_digest():
     assert mcp_tool._trust_gate_check(
         "codex-computer-use", "click", ACTION_ARGS, "child-1"
     ) is None
+
+
+def test_canonical_launcher_aliases_share_state_and_exact_action_grant(monkeypatch):
+    registry = ToolRegistry()
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        mcp_tool.register_mcp_servers({"parent-cua-alias": _cua_config()})
+        mcp_tool.register_mcp_servers({"child-cua-alias": _cua_config()})
+
+    mcp_tool._record_mcp_state_observation(
+        task_id="child-alias",
+        server_name="child-cua-alias",
+        app="Google Chrome",
+        state_digest=STATE_DIGEST,
+    )
+    mcp_tool._issue_mcp_exact_action_grant(
+        task_id="child-alias",
+        server_name="parent-cua-alias",
+        app="Google Chrome",
+        state_digest=STATE_DIGEST,
+        tool_name="click",
+        arguments=ACTION_ARGS,
+        ttl_seconds=30,
+    )
+    monkeypatch.setattr(
+        "tools.approval.request_elicitation_consent",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("canonical alias grant must avoid popup")
+        ),
+    )
+
+    assert mcp_tool._trust_gate_check(
+        "child-cua-alias", "click", ACTION_ARGS, "child-alias"
+    ) is None
+
+
+def test_state_digest_is_decorated_for_canonical_launcher_alias() -> None:
+    registry = ToolRegistry()
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        mcp_tool.register_mcp_servers({"state-cua-alias": _cua_config()})
+
+    decorated = mcp_tool._record_state_result_for_exact_grant(
+        server_name="state-cua-alias",
+        tool_name="get_app_state",
+        args={"app": "Google Chrome"},
+        task_id="child-state",
+        result=json.dumps({"result": {"window": "Work"}}),
+    )
+
+    assert len(json.loads(decorated)["state_digest"]) == 64
 
 
 def test_state_digest_never_opens_media_paths_from_untrusted_result_text(
