@@ -4938,7 +4938,11 @@ def _resolved_route_auth_is_proven(
 
 
 def _resolve_subagent_route(
-    *, provider: Optional[str], model: Optional[str], parent_agent: Any
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+    parent_agent: Any,
+    exact_empty: bool = False,
 ) -> Dict[str, Any]:
     """Resolve a public route through the active profile's native auth path.
 
@@ -4980,6 +4984,20 @@ def _resolve_subagent_route(
             or resolved_model != requested_model
         ):
             raise ValueError("unresolved route")
+
+        # The user's optional Codex App Server runtime owns a complete agent
+        # turn and its built-in mutation tools.  An exact-empty lifecycle child
+        # instead needs Hermes' tool-free Responses transport so the native
+        # read-only gate can attest and preserve the empty toolset.  Keep this
+        # adaptation local to explicitly routed exact-empty children; normal
+        # Codex sessions and tool-enabled children retain App Server.
+        if (
+            exact_empty
+            and resolved_provider == "openai-codex"
+            and str(resolved.get("api_mode") or "").strip().lower()
+            == "codex_app_server"
+        ):
+            resolved = {**resolved, "api_mode": "codex_responses"}
 
         from hermes_cli.models import validate_requested_model
 

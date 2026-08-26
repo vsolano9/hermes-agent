@@ -803,6 +803,7 @@ class SubagentLifecycleService:
                 provider=requested.provider,
                 model=requested.model,
                 parent_agent=parent,
+                exact_empty=True,
             )
             receipt = _assess_native_read_only_route(resolved)
             route = SubagentRouteIdentity(receipt.provider, receipt.model)
@@ -915,6 +916,10 @@ class SubagentLifecycleService:
 
         route = None
         route_resolution_failed = False
+        exact_empty = (
+            resolved_request.exact_toolsets
+            and not resolved_request.child_toolsets
+        )
         if resolved_request.is_v2 and (
             resolved_request.provider is not None or request.model is not None
         ):
@@ -923,6 +928,7 @@ class SubagentLifecycleService:
                     provider=resolved_request.provider,
                     model=request.model,
                     parent_agent=parent,
+                    exact_empty=exact_empty,
                 )
             except Exception:
                 route_resolution_failed = True
@@ -934,7 +940,7 @@ class SubagentLifecycleService:
             )
 
         read_only_receipt = None
-        if resolved_request.exact_toolsets and not resolved_request.child_toolsets:
+        if exact_empty:
             effective_route = route or {
                 "provider": getattr(parent, "provider", None),
                 "model": getattr(parent, "model", None),

@@ -1888,6 +1888,101 @@ def test_exact_empty_native_read_only_transport_is_allowlisted_and_fail_closed(
     assert not canary.exists()
 
 
+def test_openai_codex_exact_empty_route_uses_responses_not_app_server(
+    monkeypatch,
+):
+    captured = []
+    validations = []
+    _install_child_seams(monkeypatch, captured)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-route-canary",
+            "api_mode": "codex_app_server",
+            "request_overrides": {},
+        },
+    )
+
+    def validate(model, provider, **kwargs):
+        validations.append((model, provider, kwargs.get("api_mode")))
+        return {
+            "accepted": True,
+            "recognized": True,
+            "corrected_model": None,
+        }
+
+    monkeypatch.setattr("hermes_cli.models.validate_requested_model", validate)
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolved_exact_empty_model_tools", lambda: ()
+    )
+    service = SubagentLifecycleService(lambda: _parent())
+
+    assessment = service.assess_route("openai-codex", "gpt-5.6-sol")
+    handle = service.launch(
+        SubagentLaunchRequestV2(
+            api_contract_version=2,
+            base=SubagentLaunchRequest(
+                goal="read-only codex task", model="gpt-5.6-sol"
+            ),
+            toolset_mode="exact",
+            exact_toolsets=(),
+            provider="openai-codex",
+        )
+    )
+
+    assert service.wait(handle, timeout_seconds=1).completed is True
+    assert assessment.eligible is True
+    assert assessment.transport == "codex_responses"
+    assert validations == [
+        ("gpt-5.6-sol", "openai-codex", "codex_responses"),
+        ("gpt-5.6-sol", "openai-codex", "codex_responses"),
+    ]
+    assert captured[0]["override_api_mode"] == "codex_responses"
+
+
+def test_openai_codex_nonempty_route_preserves_app_server_runtime(monkeypatch):
+    captured = []
+    _install_child_seams(monkeypatch, captured)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-route-canary",
+            "api_mode": "codex_app_server",
+            "request_overrides": {},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "recognized": True,
+            "corrected_model": None,
+        },
+    )
+    service = SubagentLifecycleService(lambda: _parent())
+
+    handle = service.launch(
+        SubagentLaunchRequestV2(
+            api_contract_version=2,
+            base=SubagentLaunchRequest(
+                goal="tool-enabled codex task", model="gpt-5.6-sol"
+            ),
+            toolset_mode="exact",
+            exact_toolsets=("file",),
+            provider="openai-codex",
+        )
+    )
+
+    assert service.wait(handle, timeout_seconds=1).completed is True
+    assert captured[0]["override_api_mode"] == "codex_app_server"
+
+
 def test_transport_gate_does_not_reinterpret_routed_inherit_or_exact_nonempty(
     monkeypatch,
 ):
