@@ -154,6 +154,21 @@ def test_model_free_call_attests_then_calls_and_always_deletes_thread() -> None:
     assert client.closed is True
 
 
+def test_probe_attests_catalog_without_calling_a_computer_use_tool() -> None:
+    client = FakeClient()
+
+    tools = _broker(client).probe(timeout=2.0)
+
+    assert tuple(name for name, _description in tools) == CODEX_CUA_TOOL_NAMES
+    assert all(description for _name, description in tools)
+    assert [method for method, _params in client.requests] == [
+        "thread/start",
+        "mcpServerStatus/list",
+        "thread/delete",
+    ]
+    assert client.closed is True
+
+
 def test_catalog_plugin_or_tool_drift_fails_before_tool_call() -> None:
     from agent.transports.codex_cua_broker import CodexCUACatalogDrift
 

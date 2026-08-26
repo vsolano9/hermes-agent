@@ -19,6 +19,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -34,6 +35,7 @@ from tools.mcp_pinned_surfaces import (
     CODEX_CUA_APP_SERVER_PLUGIN_ID,
     CODEX_CUA_TOOL_NAMES,
     app_server_catalog_sha256,
+    expected_app_server_tools,
 )
 
 
@@ -716,62 +718,12 @@ class CodexCUABroker:
         *,
         timeout: float,
     ) -> dict:
-        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
-            raise CodexCUAProtocolError("Computer Use timeout must be positive and finite")
-        deadline = time.monotonic() + timeout
+        self._validate_timeout(timeout)
         if tool not in CODEX_CUA_TOOL_NAMES:
             raise CodexCUAProtocolError(f"unpublished Computer Use tool: {tool}")
         if not isinstance(arguments, Mapping):
             raise CodexCUAProtocolError("Computer Use arguments must be a mapping")
-        launcher = self._binary_resolver(deadline=deadline)
-        ready = self._daemon.ensure_ready(launcher, deadline=deadline)
-        if (
-            ready.version not in SUPPORTED_CODEX_APP_SERVER_VERSIONS
-            or ready.version != ready.verified.version
-        ):
-            raise CodexCUAVersionMismatch("managed App Server version is unsupported")
-        ready.verified.recheck()
-        self._remaining(deadline, "daemon readiness")
-        open_timeout = self._remaining(deadline, "socket connection")
-        client = (
-            self._client_factory(ready.socket_path, open_timeout)
-            if self._client_factory is not None
-            else self._make_client(ready.socket_path, ready.verified, open_timeout)
-        )
-        thread_id: Optional[str] = None
-        cleanup_error: Optional[BaseException] = None
-        try:
-            self._remaining(deadline, "socket connection")
-            initialized = client.initialize(
-                timeout=min(self._remaining(deadline, "initialize"), 10.0)
-            )
-            if not isinstance(initialized, dict):
-                raise CodexCUAProtocolError("App Server initialize result is invalid")
-            agent_version = _VERSION_RE.search(str(initialized.get("userAgent") or ""))
-            if agent_version is None or agent_version.group(1) != ready.version:
-                raise CodexCUAVersionMismatch("connected App Server version differs")
-            started = client.request(
-                "thread/start",
-                {"cwd": self._cwd, "ephemeral": False},
-                timeout=self._remaining(deadline, "thread/start"),
-            )
-            if not isinstance(started, dict):
-                raise CodexCUAProtocolError("thread/start result is invalid")
-            thread = started.get("thread")
-            if not isinstance(thread, dict):
-                raise CodexCUAProtocolError("thread/start omitted the thread")
-            thread_id = thread.get("id")
-            if (
-                not isinstance(thread_id, str)
-                or not thread_id
-                or thread.get("ephemeral") is not False
-                or not isinstance(thread.get("path"), str)
-                or not thread.get("path")
-            ):
-                raise CodexCUAProtocolError(
-                    "App Server did not create a deletable persisted control thread"
-                )
-            self._attest_catalog(client, thread_id, deadline)
+        with self._attested_session(timeout) as (client, thread_id, deadline):
             try:
                 result = client.request(
                     "mcpServer/tool/call",
@@ -833,6 +785,84 @@ class CodexCUABroker:
                     "Computer Use result is unknown after an accepted request frame; "
                     "do not retry this action"
                 ) from exc
+
+    def probe(self, *, timeout: float) -> tuple[tuple[str, str], ...]:
+        """Attest the live Computer Use catalog without invoking a tool."""
+
+        self._validate_timeout(timeout)
+        with self._attested_session(timeout):
+            tools = expected_app_server_tools()
+            return tuple(
+                (name, str(tools[name]["description"]))
+                for name in CODEX_CUA_TOOL_NAMES
+            )
+
+    @staticmethod
+    def _validate_timeout(timeout: float) -> None:
+        if (
+            not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise CodexCUAProtocolError(
+                "Computer Use timeout must be positive and finite"
+            )
+
+    @contextmanager
+    def _attested_session(self, timeout: float):
+        """Open one model-free, catalog-attested App Server control thread."""
+
+        deadline = time.monotonic() + timeout
+        launcher = self._binary_resolver(deadline=deadline)
+        ready = self._daemon.ensure_ready(launcher, deadline=deadline)
+        if (
+            ready.version not in SUPPORTED_CODEX_APP_SERVER_VERSIONS
+            or ready.version != ready.verified.version
+        ):
+            raise CodexCUAVersionMismatch("managed App Server version is unsupported")
+        ready.verified.recheck()
+        self._remaining(deadline, "daemon readiness")
+        open_timeout = self._remaining(deadline, "socket connection")
+        client = (
+            self._client_factory(ready.socket_path, open_timeout)
+            if self._client_factory is not None
+            else self._make_client(ready.socket_path, ready.verified, open_timeout)
+        )
+        thread_id: Optional[str] = None
+        cleanup_error: Optional[BaseException] = None
+        try:
+            self._remaining(deadline, "socket connection")
+            initialized = client.initialize(
+                timeout=min(self._remaining(deadline, "initialize"), 10.0)
+            )
+            if not isinstance(initialized, dict):
+                raise CodexCUAProtocolError("App Server initialize result is invalid")
+            agent_version = _VERSION_RE.search(str(initialized.get("userAgent") or ""))
+            if agent_version is None or agent_version.group(1) != ready.version:
+                raise CodexCUAVersionMismatch("connected App Server version differs")
+            started = client.request(
+                "thread/start",
+                {"cwd": self._cwd, "ephemeral": False},
+                timeout=self._remaining(deadline, "thread/start"),
+            )
+            if not isinstance(started, dict):
+                raise CodexCUAProtocolError("thread/start result is invalid")
+            thread = started.get("thread")
+            if not isinstance(thread, dict):
+                raise CodexCUAProtocolError("thread/start omitted the thread")
+            thread_id = thread.get("id")
+            if (
+                not isinstance(thread_id, str)
+                or not thread_id
+                or thread.get("ephemeral") is not False
+                or not isinstance(thread.get("path"), str)
+                or not thread.get("path")
+            ):
+                raise CodexCUAProtocolError(
+                    "App Server did not create a deletable persisted control thread"
+                )
+            self._attest_catalog(client, thread_id, deadline)
+            yield client, thread_id, deadline
         finally:
             if thread_id is not None:
                 try:

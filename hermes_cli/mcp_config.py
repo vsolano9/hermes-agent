@@ -760,7 +760,10 @@ def cmd_mcp_test(args):
     print(color(f"  Testing '{name}'...", Colors.CYAN))
 
     # Show transport info
-    if "url" in cfg:
+    host_broker_transport = cfg.get("transport") == "codex_app_server"
+    if host_broker_transport:
+        _info("Transport: Codex App Server → signed host broker")
+    elif "url" in cfg:
         _info(f"Transport: HTTP → {cfg['url']}")
     else:
         cmd = cfg.get("command", "?")
@@ -787,7 +790,26 @@ def cmd_mcp_test(args):
     # Attempt connection
     start = time.monotonic()
     try:
-        tools = _probe_single_server(name, cfg)
+        if host_broker_transport:
+            from tools.mcp_tool import (
+                _get_codex_cua_broker,
+                _get_host_pinned_surface,
+            )
+
+            if _get_host_pinned_surface(cfg) is None:
+                raise ValueError(
+                    "Codex App Server transport is not the pinned host adapter"
+                )
+            raw_timeout = cfg.get("connect_timeout", 30)
+            try:
+                connect_timeout = max(1.0, float(raw_timeout))
+            except (TypeError, ValueError):
+                connect_timeout = 30.0
+            tools = list(
+                _get_codex_cua_broker().probe(timeout=connect_timeout)
+            )
+        else:
+            tools = _probe_single_server(name, cfg)
         elapsed_ms = (time.monotonic() - start) * 1000
     except Exception as exc:
         elapsed_ms = (time.monotonic() - start) * 1000

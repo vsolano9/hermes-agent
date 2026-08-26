@@ -302,6 +302,47 @@ class TestMcpTest:
         assert "Connected" in out
         assert "Tools discovered: 2" in out
 
+    def test_codex_app_server_uses_host_broker_instead_of_stdio_probe(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        from hermes_cli.mcp_catalog import _build_server_config, get_entry
+
+        entry = get_entry("codex-computer-use")
+        assert entry is not None
+        _seed_config(
+            tmp_path,
+            {"codex-computer-use": _build_server_config(entry, None)},
+        )
+        observed = {}
+
+        class Broker:
+            def probe(self, *, timeout):
+                observed["timeout"] = timeout
+                return (
+                    ("list_apps", "List local applications"),
+                    ("get_app_state", "Inspect an application"),
+                )
+
+        monkeypatch.setattr(
+            "tools.mcp_tool._get_codex_cua_broker", lambda: Broker()
+        )
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda *_args, **_kwargs: pytest.fail(
+                "commandless Codex transport must not use the stdio probe"
+            ),
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="codex-computer-use"))
+
+        out = capsys.readouterr().out
+        assert "Transport: Codex App Server" in out
+        assert "Connected" in out
+        assert "Tools discovered: 2" in out
+        assert "list_apps" in out
+        assert observed == {"timeout": 30.0}
+
     def test_probe_uses_configured_connect_timeout(self, monkeypatch):
         """OAuth-capable probes must not hard-code a short 30s timeout."""
         import asyncio
