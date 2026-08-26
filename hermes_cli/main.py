@@ -12542,7 +12542,9 @@ _AGENT_SUBCOMMANDS = {
 
 
 def _is_tui_chat_launch(args) -> bool:
-    return bool(getattr(args, "tui", False) or os.environ.get("HERMES_TUI") == "1")
+    if getattr(args, "command", None) not in {None, "chat"}:
+        return False
+    return _resolve_use_tui(args)
 
 
 def _command_has_dedicated_mcp_startup(args) -> bool:
@@ -12582,7 +12584,8 @@ def _prepare_agent_startup(args) -> None:
         return
 
     _accept_hooks = bool(getattr(args, "accept_hooks", False))
-    if not _is_tui_chat_launch(args):
+    _tui_chat_launch = _is_tui_chat_launch(args)
+    if not _tui_chat_launch:
         # The TUI backend process does its own plugin discovery; the launcher
         # only spawns Node, so discovery here would be thrown-away work.
         try:
@@ -12602,7 +12605,7 @@ def _prepare_agent_startup(args) -> None:
                 exc_info=True,
             )
     _run_inline_mcp_discovery = True
-    if _is_tui_chat_launch(args):
+    if _tui_chat_launch:
         # The TUI launcher hands off to a dedicated startup path that already
         # backgrounds MCP discovery with a bounded join before the first tool
         # snapshot.
