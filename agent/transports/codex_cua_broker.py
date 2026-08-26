@@ -44,6 +44,7 @@ CODEX_CLI_IDENTIFIER = "codex"
 CODEX_CUA_SERVER_NAME = CODEX_CUA_APP_SERVER_NAME
 CODEX_CUA_PLUGIN_ID = CODEX_CUA_APP_SERVER_PLUGIN_ID
 APP_SERVER_SOCKET_NAME = "app-server-control.sock"
+SUPPORTED_CODEX_APP_SERVER_VERSIONS = frozenset({"0.149.0-alpha.4.3"})
 MAX_CATALOG_PAGES = 8
 MAX_CATALOG_ROWS = 100
 _VERSION_RE = re.compile(r"(?:codex-cli/|codex-cli\s+)?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)")
@@ -155,6 +156,7 @@ class VerifiedCodex:
 class ReadyDaemon:
     socket_path: str
     version: str
+    verified: VerifiedCodex
 
 
 def _account_home() -> Path:
@@ -178,7 +180,7 @@ def _minimal_daemon_env(codex_home: Path) -> dict[str, str]:
 
 def _designated_requirement(identifier: str) -> str:
     return (
-        f'=identifier "{identifier}" and anchor apple generic and '
+        f'identifier "{identifier}" and anchor apple generic and '
         "certificate 1[field.1.2.840.113635.100.6.2.6] exists and "
         "certificate leaf[field.1.2.840.113635.100.6.1.13] exists and "
         f'certificate leaf[subject.OU] = "{OPENAI_TEAM_ID}"'
@@ -194,7 +196,7 @@ def _codesign_identity(
     verify = subprocess.run(
         [
             "/usr/bin/codesign", "--verify", "--deep", "--strict",
-            "--verbose=2", "-R", _designated_requirement(expected_identifier),
+            "--verbose=2", "-R", "=" + _designated_requirement(expected_identifier),
             str(path),
         ],
         capture_output=True,
@@ -303,6 +305,87 @@ def resolve_verified_codex(
     if proc.returncode != 0 or match is None:
         raise CodexCUABinaryUntrusted("embedded Codex CLI version is unavailable")
     verified = VerifiedCodex(str(path), match.group(1), snapshot)
+    verified.recheck()
+    return verified
+
+
+def _snapshot_path(path: Path) -> _PathSnapshot:
+    info = os.lstat(path)
+    return _PathSnapshot(
+        str(path), info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+        info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _resolve_verified_managed_codex(
+    reported_path: str,
+    version: str,
+    codex_home: Path,
+    *,
+    deadline: Optional[float] = None,
+) -> VerifiedCodex:
+    """Bind daemon JSON to the signed standalone release that owns the UDS."""
+
+    expected_alias = codex_home / "packages" / "standalone" / "current" / "codex"
+    if reported_path != str(expected_alias):
+        raise CodexCUABinaryUntrusted("managed Codex path is not the official alias")
+    machine = os.uname().machine
+    platform = {"arm64": "aarch64", "x86_64": "x86_64"}.get(machine)
+    if platform is None:
+        raise CodexCUABinaryUntrusted("managed Codex platform is unsupported")
+    release_root = codex_home / "packages" / "standalone" / "releases"
+    release_dir = release_root / f"{version}-{platform}-apple-darwin"
+    expected_path = release_dir / "bin" / "codex"
+    try:
+        actual_path = expected_alias.resolve(strict=True)
+    except OSError as exc:
+        raise CodexCUABinaryUntrusted("managed Codex path is unavailable") from exc
+    if actual_path != expected_path:
+        raise CodexCUABinaryUntrusted("managed Codex path/version layout drifted")
+
+    current_link = expected_alias.parent
+    package_link = release_dir / "codex"
+    try:
+        current_info = os.lstat(current_link)
+        package_info = os.lstat(package_link)
+    except OSError as exc:
+        raise CodexCUABinaryUntrusted("managed Codex alias chain is unavailable") from exc
+    if (
+        not stat.S_ISLNK(current_info.st_mode)
+        or current_info.st_uid != os.getuid()
+        or current_link.resolve(strict=True) != release_dir
+        or not stat.S_ISLNK(package_info.st_mode)
+        or package_info.st_uid != os.getuid()
+        or os.readlink(package_link) != "bin/codex"
+    ):
+        raise CodexCUABinaryUntrusted("managed Codex alias chain drifted")
+
+    snapshot = _trusted_path_snapshot(actual_path) + (
+        _snapshot_path(current_link),
+        _snapshot_path(package_link),
+    )
+    cli_id, cli_team = _codesign_identity(
+        actual_path, CODEX_CLI_IDENTIFIER, deadline=deadline
+    )
+    if (cli_id, cli_team) != (CODEX_CLI_IDENTIFIER, OPENAI_TEAM_ID):
+        raise CodexCUABinaryUntrusted("managed Codex CLI identity is not trusted")
+    inspected = subprocess.run(
+        [str(actual_path), "--version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_bounded_timeout(deadline, 10.0, "managed Codex version inspection"),
+        stdin=subprocess.DEVNULL,
+        env=_minimal_daemon_env(codex_home),
+    )
+    match = _VERSION_RE.search(inspected.stdout or "")
+    if inspected.returncode != 0 or match is None:
+        raise CodexCUABinaryUntrusted("managed Codex CLI version is unavailable")
+    if match.group(1) != version:
+        raise CodexCUAVersionMismatch("managed Codex binary version drifted")
+    verified = VerifiedCodex(str(actual_path), version, snapshot)
     verified.recheck()
     return verified
 
@@ -546,15 +629,36 @@ class CodexAppServerDaemonController:
             raise CodexCUADaemonUnavailable("daemon version response was invalid") from exc
         if not isinstance(versions, dict):
             raise CodexCUADaemonUnavailable("daemon version response was invalid")
-        cli_version = str(versions.get("managedCodexVersion") or versions.get("codexVersion") or "")
-        daemon_version = str(versions.get("appServerVersion") or "")
-        if version_result.returncode != 0 or not daemon_version:
+        managed_path = versions.get("managedCodexPath")
+        managed_version = versions.get("managedCodexVersion")
+        daemon_version = versions.get("appServerVersion")
+        launcher_version = versions.get("cliVersion")
+        reported_socket = versions.get("socketPath")
+        if (
+            version_result.returncode != 0
+            or versions.get("status") != "running"
+            or versions.get("backend") != "pid"
+            or not isinstance(managed_path, str)
+            or not isinstance(managed_version, str)
+            or not isinstance(daemon_version, str)
+            or not isinstance(launcher_version, str)
+            or not isinstance(reported_socket, str)
+        ):
             raise CodexCUADaemonUnavailable("running daemon version is unavailable")
-        if cli_version and cli_version != verified.version:
-            raise CodexCUAVersionMismatch("managed Codex CLI version drifted")
-        if daemon_version != verified.version:
-            raise CodexCUAVersionMismatch("running App Server version drifted")
         socket_path = control / APP_SERVER_SOCKET_NAME
+        if launcher_version != verified.version:
+            raise CodexCUAVersionMismatch("daemon controller CLI version drifted")
+        if managed_version != daemon_version:
+            raise CodexCUAVersionMismatch("managed Codex and App Server versions differ")
+        if daemon_version not in SUPPORTED_CODEX_APP_SERVER_VERSIONS:
+            raise CodexCUAVersionMismatch("App Server protocol version is unsupported")
+        if reported_socket != str(socket_path):
+            raise CodexCUADaemonUnavailable("daemon socket path drifted")
+        managed = _resolve_verified_managed_codex(
+            managed_path, managed_version, self.codex_home, deadline=deadline
+        )
+        managed.recheck()
+        verified.recheck()
         socket_deadline = time.monotonic() + 5.0
         if deadline is not None:
             socket_deadline = min(socket_deadline, deadline)
@@ -566,7 +670,8 @@ class CodexAppServerDaemonController:
                 if time.monotonic() >= socket_deadline:
                     raise CodexCUADaemonUnavailable("App Server socket did not appear")
                 time.sleep(min(0.05, max(0.0, socket_deadline - time.monotonic())))
-        return ReadyDaemon(str(socket_path), daemon_version)
+        managed.recheck()
+        return ReadyDaemon(str(socket_path), daemon_version, managed)
 
 
 class CodexCUABroker:
@@ -613,16 +718,20 @@ class CodexCUABroker:
             raise CodexCUAProtocolError(f"unpublished Computer Use tool: {tool}")
         if not isinstance(arguments, Mapping):
             raise CodexCUAProtocolError("Computer Use arguments must be a mapping")
-        verified = self._binary_resolver(deadline=deadline)
-        ready = self._daemon.ensure_ready(verified, deadline=deadline)
-        if ready.version != verified.version:
-            raise CodexCUAVersionMismatch("daemon and verified CLI versions differ")
+        launcher = self._binary_resolver(deadline=deadline)
+        ready = self._daemon.ensure_ready(launcher, deadline=deadline)
+        if (
+            ready.version not in SUPPORTED_CODEX_APP_SERVER_VERSIONS
+            or ready.version != ready.verified.version
+        ):
+            raise CodexCUAVersionMismatch("managed App Server version is unsupported")
+        ready.verified.recheck()
         self._remaining(deadline, "daemon readiness")
         open_timeout = self._remaining(deadline, "socket connection")
         client = (
             self._client_factory(ready.socket_path, open_timeout)
             if self._client_factory is not None
-            else self._make_client(ready.socket_path, verified, open_timeout)
+            else self._make_client(ready.socket_path, ready.verified, open_timeout)
         )
         thread_id: Optional[str] = None
         cleanup_error: Optional[BaseException] = None
@@ -634,7 +743,7 @@ class CodexCUABroker:
             if not isinstance(initialized, dict):
                 raise CodexCUAProtocolError("App Server initialize result is invalid")
             agent_version = _VERSION_RE.search(str(initialized.get("userAgent") or ""))
-            if agent_version is None or agent_version.group(1) != verified.version:
+            if agent_version is None or agent_version.group(1) != ready.version:
                 raise CodexCUAVersionMismatch("connected App Server version differs")
             started = client.request(
                 "thread/start",

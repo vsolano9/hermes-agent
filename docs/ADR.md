@@ -15,7 +15,12 @@ repeated Screen Recording prompts even when the OpenAI application has already
 been granted access.
 
 The signed Codex CLI bundled in ChatGPT 0.149 exposes a maintained app-server
-daemon with a Unix-socket WebSocket transport. Its generated v2 protocol has
+daemon with a Unix-socket WebSocket transport. OpenAI's daemon lifecycle
+intentionally uses the standalone binary under
+`CODEX_HOME/packages/standalone/current`, so the launcher CLI and running
+app-server can have different versions. OpenAI documents both the daemon and
+app-server protocol as experimental and guarantees generated schemas only for
+the Codex version that generated them. The generated 0.149 v2 protocol has
 the three model-free calls needed here: `mcpServerStatus/list`,
 `mcpServer/tool/call`, and `thread/delete`. `thread/start` accepts
 `ephemeral: true`. None of these operations requires `turn/start`, and Hermes
@@ -27,20 +32,36 @@ Decision:
   daemon discovery, trust validation, one fresh socket connection, one
   ephemeral thread, exact catalog attestation, the tool call, and mandatory
   thread deletion.
-- Resolve only `/Applications/ChatGPT.app/Contents/Resources/codex`. Before a
-  daemon start, verify the ChatGPT bundle and CLI designated requirements for
-  OpenAI team `2DC432GLL2`, reject symbolic links, unsafe ownership or mode on
-  every path component, and recheck the same vnode identities immediately
-  before execution.
+- Resolve only `/Applications/ChatGPT.app/Contents/Resources/codex` as the
+  signed lifecycle controller. Before a daemon start, verify the ChatGPT
+  bundle and CLI designated requirements for OpenAI team `2DC432GLL2`, reject
+  symbolic links, unsafe ownership or mode on every embedded path component,
+  and recheck the same vnode identities immediately before execution.
 - Treat the OS account's `CODEX_HOME/app-server-control` directory and Unix
   socket as a security boundary. Reject links, wrong ownership, permissive
-  modes, non-socket endpoints, and version/catalog drift. Connect the raw Unix
-  socket, read macOS `LOCAL_PEERPID`, require its `proc_pidpath` to equal the
-  verified embedded CLI, and bind that live PID through Security.framework to
-  the exact OpenAI designated requirement before the WebSocket handshake.
+  modes, non-socket endpoints, and version/catalog drift. Parse the complete
+  machine-readable daemon-version response, require its launcher version to
+  match the embedded controller, resolve its exact official `managedCodexPath`
+  alias to the versioned standalone release, verify that real binary's OpenAI
+  signature and self-reported version, and snapshot both the immutable release
+  chain and official aliases. Connect the raw Unix socket, read macOS
+  `LOCAL_PEERPID`, require its `proc_pidpath` to equal that verified managed
+  realpath, and bind that live PID through Security.framework to the exact
+  OpenAI designated requirement before the WebSocket handshake. The
+  `codesign -R` CLI receives its required leading `=` wrapper; the equivalent
+  Security.framework parser string does not, because Apple rejects that CLI
+  wrapper with `errSecCSReqInvalid`.
   Start/readiness work is coordinated by an account-global lock and a minimal
   environment. The shared daemon outlives Hermes panes and is not stopped
   during MCP shutdown.
+- Do not infer compatibility from semver ordering. Accept only explicitly
+  tested protocol versions, initially `0.149.0-alpha.4.3`, and require
+  `managedCodexVersion == appServerVersion == initialize userAgent version`.
+  Launcher/managed equality is not required. The observed signed 0.147 daemon
+  remains rejected: its full status row omits `pluginId`, changes
+  `serverInfo`, and refuses `thread/delete` for ephemeral threads. Operators
+  move the managed runtime through OpenAI's exact-release installer and daemon
+  restart; Hermes never substitutes or downloads a binary itself.
 - For every call, connect directly to the Unix socket with WebSocket framing,
   initialize, start an ephemeral thread, request the complete MCP status
   catalog, and attest the exact CUA plugin id and immutable ten-tool digest
@@ -95,6 +116,9 @@ Consequences:
 - A Computer Use call fails closed if the ChatGPT/Codex installation, daemon,
   connected peer, socket, protocol version, plugin identity, result envelope,
   or tool catalog drifts.
+- A newer signed launcher may reuse an older signed managed daemon only when
+  the managed/app-server protocol version is on the explicit compatibility
+  allowlist; currently this means exact 0.149.0-alpha.4.3 only.
 - The first granted call may pay daemon-readiness latency; later calls reuse
   one account-global daemon but still receive isolated connections and
   ephemeral threads.

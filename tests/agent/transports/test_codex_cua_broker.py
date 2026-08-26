@@ -77,8 +77,13 @@ class FakeClient:
 
 
 class FakeDaemon:
-    def __init__(self, version="0.149.0-alpha.4.3") -> None:
+    def __init__(self, version="0.149.0-alpha.4.3", verified=None) -> None:
+        from agent.transports.codex_cua_broker import VerifiedCodex
+
         self.version = version
+        self.verified = verified or VerifiedCodex(
+            "/managed/codex", version, ()
+        )
         self.calls = []
 
     def ensure_ready(self, verified, *, deadline=None):
@@ -87,6 +92,7 @@ class FakeDaemon:
         return type("Ready", (), {
             "socket_path": "/tmp/app-server-control.sock",
             "version": self.version,
+            "verified": self.verified,
         })()
 
 
@@ -380,6 +386,44 @@ def test_daemon_or_initialize_version_drift_fails_before_thread() -> None:
     assert drifted.closed is True
 
 
+def test_broker_authenticates_managed_peer_without_launcher_version_equality(
+    monkeypatch,
+) -> None:
+    from agent.transports.codex_cua_broker import CodexCUABroker, VerifiedCodex
+
+    launcher = VerifiedCodex(
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+        "0.150.0-alpha.1",
+        (),
+    )
+    managed = VerifiedCodex(
+        "/Users/victor/.codex/packages/standalone/releases/"
+        "0.149.0-alpha.4.3-aarch64-apple-darwin/bin/codex",
+        "0.149.0-alpha.4.3",
+        (),
+    )
+    client = FakeClient()
+    captured = []
+
+    def fake_make_client(socket_path, verified, open_timeout):
+        captured.append((socket_path, verified, open_timeout))
+        return client
+
+    monkeypatch.setattr(
+        CodexCUABroker, "_make_client", staticmethod(fake_make_client)
+    )
+    broker = CodexCUABroker(
+        binary_resolver=lambda **_kwargs: launcher,
+        daemon_controller=FakeDaemon(verified=managed),
+        cwd="/tmp",
+    )
+
+    result = broker.call("list_apps", {}, timeout=2.0)
+
+    assert result["structuredContent"] == {"windows": []}
+    assert captured[0][1] == managed
+
+
 def test_malformed_initialize_thread_and_catalog_envelopes_fail_closed() -> None:
     from agent.transports.codex_cua_broker import (
         CodexCUACatalogDrift,
@@ -539,6 +583,7 @@ def test_full_broker_sequence_over_real_local_uds_rejects_server_requests() -> N
                 return type("Ready", (), {
                     "socket_path": str(socket_path),
                     "version": self.version,
+                    "verified": self.verified,
                 })()
 
         broker = CodexCUABroker(
@@ -653,6 +698,7 @@ def test_broker_deadline_bounds_stalled_websocket_upgrade() -> None:
             return type("Ready", (), {
                 "socket_path": str(socket_path),
                 "version": self.version,
+                "verified": self.verified,
             })()
 
     broker = CodexCUABroker(

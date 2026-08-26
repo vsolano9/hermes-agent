@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 from pathlib import Path
 import socket
+import sys
 import tempfile
 from types import SimpleNamespace
 
@@ -133,6 +135,98 @@ def test_codesign_verification_enforces_exact_apple_designated_requirement(
     )
 
 
+def test_security_framework_requirement_omits_codesign_cli_prefix() -> None:
+    """Security.framework rejects codesign's leading ``=`` wrapper."""
+
+    requirement = broker._designated_requirement(broker.CODEX_CLI_IDENTIFIER)
+
+    assert requirement == (
+        'identifier "codex" and anchor apple generic and '
+        "certificate 1[field.1.2.840.113635.100.6.2.6] exists and "
+        "certificate leaf[field.1.2.840.113635.100.6.1.13] exists and "
+        'certificate leaf[subject.OU] = "2DC432GLL2"'
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Security.framework requirement parsing is macOS-only",
+)
+def test_security_framework_parses_exact_peer_requirement_before_validity() -> None:
+    """The no-prefix requirement parses; identity failure is a later check."""
+
+    core = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    security = ctypes.CDLL(
+        "/System/Library/Frameworks/Security.framework/Security"
+    )
+    core.CFRelease.argtypes = [ctypes.c_void_p]
+    core.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+    ]
+    core.CFStringCreateWithCString.restype = ctypes.c_void_p
+    security.SecRequirementCreateWithString.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    security.SecRequirementCreateWithString.restype = ctypes.c_int32
+    security.SecCodeCopySelf.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    security.SecCodeCopySelf.restype = ctypes.c_int32
+    security.SecCodeCheckValidity.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    security.SecCodeCheckValidity.restype = ctypes.c_int32
+
+    requirement_text = broker._designated_requirement(broker.CODEX_CLI_IDENTIFIER)
+    assert not requirement_text.startswith("=")
+    requirement_string = core.CFStringCreateWithCString(
+        None,
+        requirement_text.encode("utf-8"),
+        0x08000100,  # kCFStringEncodingUTF8
+    )
+    requirement_ref = ctypes.c_void_p()
+    self_code_ref = ctypes.c_void_p()
+    try:
+        assert requirement_string
+        parse_status = security.SecRequirementCreateWithString(
+            requirement_string,
+            0,
+            ctypes.byref(requirement_ref),
+        )
+        assert parse_status == 0
+        assert requirement_ref.value
+
+        # Parsing and trust evaluation are distinct. The pytest interpreter is
+        # valid code, but it must not satisfy the exact OpenAI Codex identity.
+        assert security.SecCodeCopySelf(0, ctypes.byref(self_code_ref)) == 0
+        assert self_code_ref.value
+        assert (
+            security.SecCodeCheckValidity(
+                self_code_ref,
+                0,
+                requirement_ref,
+            )
+            != 0
+        )
+    finally:
+        for reference in (
+            self_code_ref.value,
+            requirement_ref.value,
+            requirement_string,
+        ):
+            if reference:
+                core.CFRelease(reference)
+
+
 def test_private_control_directory_rejects_loose_mode(tmp_path) -> None:
     control = tmp_path / "app-server-control"
     control.mkdir(mode=0o755)
@@ -187,7 +281,17 @@ def test_daemon_controller_fails_closed_on_version_response_drift(
     monkeypatch, tmp_path, version_payload, error_type
 ) -> None:
     codex_home = tmp_path / "codex-home"
-    (codex_home / "app-server-control").mkdir(parents=True, mode=0o700)
+    control = codex_home / "app-server-control"
+    control.mkdir(parents=True, mode=0o700)
+    if version_payload != "[]":
+        version_payload = (
+            '{"status":"running","backend":"pid",'
+            f'"managedCodexPath":"{codex_home}/packages/standalone/current/codex",'
+            '"managedCodexVersion":"0.149.0-alpha.4.3",'
+            f'"socketPath":"{control / broker.APP_SERVER_SOCKET_NAME}",'
+            '"cliVersion":"0.149.0-alpha.4.3",'
+            '"appServerVersion":"0.150.0"}'
+        )
 
     def fake_run(argv, **kwargs):
         if argv[-1] == "version":
@@ -224,13 +328,27 @@ def test_daemon_controller_uses_idempotent_managed_commands_and_private_socket(
             if argv[-1] == "version":
                 return SimpleNamespace(
                     returncode=0,
-                    stdout='{"managedCodexVersion":"0.149.0-alpha.4.3",'
-                    '"appServerVersion":"0.149.0-alpha.4.3"}',
+                    stdout=(
+                        '{"status":"running","backend":"pid",'
+                        f'"managedCodexPath":"{codex_home}/packages/standalone/current/codex",'
+                        '"managedCodexVersion":"0.149.0-alpha.4.3",'
+                        f'"socketPath":"{socket_path}",'
+                        '"cliVersion":"0.149.0-alpha.4.3",'
+                        '"appServerVersion":"0.149.0-alpha.4.3"}'
+                    ),
                     stderr="",
                 )
             return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
         monkeypatch.setattr(broker.subprocess, "run", fake_run)
+        managed = broker.VerifiedCodex(
+            "/managed/codex", "0.149.0-alpha.4.3", ()
+        )
+        monkeypatch.setattr(
+            broker,
+            "_resolve_verified_managed_codex",
+            lambda *_args, **_kwargs: managed,
+        )
         verified = broker.VerifiedCodex(
             "/signed/codex", "0.149.0-alpha.4.3", ()
         )
@@ -248,3 +366,190 @@ def test_daemon_controller_uses_idempotent_managed_commands_and_private_socket(
         ]
         assert calls[0][1]["env"]["CODEX_HOME"] == str(codex_home)
         assert calls[0][1]["env"]["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def test_daemon_controller_accepts_allowlisted_signed_managed_peer_with_launcher_skew(
+    monkeypatch,
+) -> None:
+    """The embedded CLI controls lifecycle; the managed binary owns the socket."""
+
+    with tempfile.TemporaryDirectory(prefix="hcua-", dir="/tmp") as root:
+        codex_home = Path(root) / "codex-home"
+        control = codex_home / "app-server-control"
+        control.mkdir(parents=True, mode=0o700)
+        socket_path = control / broker.APP_SERVER_SOCKET_NAME
+        endpoint = socket.socket(socket.AF_UNIX)
+        endpoint.bind(str(socket_path))
+        socket_path.chmod(0o600)
+        launcher = broker.VerifiedCodex(
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "0.150.0-alpha.1",
+            (),
+        )
+        managed = broker.VerifiedCodex(
+            "/Users/victor/.codex/packages/standalone/releases/"
+            "0.149.0-alpha.4.3-aarch64-apple-darwin/bin/codex",
+            "0.149.0-alpha.4.3",
+            (),
+        )
+        reported_path = codex_home / "packages/standalone/current/codex"
+        resolved = []
+
+        def fake_run(argv, **kwargs):
+            if argv[-1] == "version":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        '{"status":"running","backend":"pid",'
+                        f'"managedCodexPath":"{reported_path}",'
+                        '"managedCodexVersion":"0.149.0-alpha.4.3",'
+                        f'"socketPath":"{socket_path}",'
+                        '"cliVersion":"0.150.0-alpha.1",'
+                        '"appServerVersion":"0.149.0-alpha.4.3"}'
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        def fake_resolve(path, version, home, *, deadline=None):
+            resolved.append((path, version, home, deadline))
+            return managed
+
+        monkeypatch.setattr(broker.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            broker, "_resolve_verified_managed_codex", fake_resolve, raising=False
+        )
+        try:
+            ready = broker.CodexAppServerDaemonController(codex_home).ensure_ready(
+                launcher
+            )
+        finally:
+            endpoint.close()
+
+        assert ready.version == "0.149.0-alpha.4.3"
+        assert ready.verified == managed
+        assert resolved == [
+            (str(reported_path), "0.149.0-alpha.4.3", codex_home, None)
+        ]
+
+
+def test_managed_peer_resolution_rejects_signed_binary_version_mismatch(
+    monkeypatch, tmp_path
+) -> None:
+    version = "0.149.0-alpha.4.3"
+    codex_home = tmp_path / "codex-home"
+    standalone = codex_home / "packages" / "standalone"
+    release = standalone / "releases" / f"{version}-aarch64-apple-darwin"
+    actual = release / "bin" / "codex"
+    actual.parent.mkdir(parents=True)
+    actual.write_bytes(b"signed fixture")
+    actual.chmod(0o755)
+    (release / "codex").symlink_to("bin/codex")
+    (standalone / "current").symlink_to(release, target_is_directory=True)
+    alias = standalone / "current" / "codex"
+
+    monkeypatch.setattr(broker.os, "uname", lambda: SimpleNamespace(machine="arm64"))
+    monkeypatch.setattr(broker, "_trusted_path_snapshot", lambda _path: ())
+    monkeypatch.setattr(
+        broker,
+        "_codesign_identity",
+        lambda *_args, **_kwargs: (broker.CODEX_CLI_IDENTIFIER, broker.OPENAI_TEAM_ID),
+    )
+    monkeypatch.setattr(
+        broker.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="codex-cli 0.150.0", stderr=""
+        ),
+    )
+
+    with pytest.raises(broker.CodexCUAVersionMismatch, match="binary version"):
+        broker._resolve_verified_managed_codex(
+            str(alias), version, codex_home
+        )
+
+
+def test_managed_peer_resolution_snapshots_official_alias_and_release(
+    monkeypatch, tmp_path
+) -> None:
+    version = "0.149.0-alpha.4.3"
+    codex_home = tmp_path / "codex-home"
+    standalone = codex_home / "packages" / "standalone"
+    release = standalone / "releases" / f"{version}-aarch64-apple-darwin"
+    actual = release / "bin" / "codex"
+    actual.parent.mkdir(parents=True)
+    actual.write_bytes(b"signed fixture")
+    actual.chmod(0o755)
+    package_alias = release / "codex"
+    package_alias.symlink_to("bin/codex")
+    current_alias = standalone / "current"
+    current_alias.symlink_to(release, target_is_directory=True)
+
+    monkeypatch.setattr(broker.os, "uname", lambda: SimpleNamespace(machine="arm64"))
+    monkeypatch.setattr(broker, "_trusted_path_snapshot", lambda _path: ())
+    monkeypatch.setattr(
+        broker,
+        "_codesign_identity",
+        lambda *_args, **_kwargs: (broker.CODEX_CLI_IDENTIFIER, broker.OPENAI_TEAM_ID),
+    )
+    monkeypatch.setattr(
+        broker.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout=f"codex-cli {version}", stderr=""
+        ),
+    )
+
+    verified = broker._resolve_verified_managed_codex(
+        str(current_alias / "codex"), version, codex_home
+    )
+
+    assert verified.path == str(actual)
+    assert verified.version == version
+    current_alias.unlink()
+    current_alias.symlink_to(release, target_is_directory=True)
+    with pytest.raises(broker.CodexCUABinaryUntrusted, match="changed"):
+        verified.recheck()
+
+
+def test_daemon_controller_rejects_live_observed_0147_before_peer_resolution(
+    monkeypatch, tmp_path
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    control = codex_home / "app-server-control"
+    control.mkdir(parents=True, mode=0o700)
+    socket_path = control / broker.APP_SERVER_SOCKET_NAME
+    reported_path = codex_home / "packages/standalone/current/codex"
+    resolved = []
+
+    def fake_run(argv, **kwargs):
+        if argv[-1] == "version":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '{"status":"running","backend":"pid",'
+                    f'"managedCodexPath":"{reported_path}",'
+                    '"managedCodexVersion":"0.147.0",'
+                    f'"socketPath":"{socket_path}",'
+                    '"cliVersion":"0.149.0-alpha.4.3",'
+                    '"appServerVersion":"0.147.0"}'
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(broker.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        broker,
+        "_resolve_verified_managed_codex",
+        lambda *_args, **_kwargs: resolved.append(True),
+    )
+    launcher = broker.VerifiedCodex(
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+        "0.149.0-alpha.4.3",
+        (),
+    )
+
+    with pytest.raises(broker.CodexCUAVersionMismatch, match="unsupported"):
+        broker.CodexAppServerDaemonController(codex_home).ensure_ready(launcher)
+    assert resolved == []
