@@ -5360,6 +5360,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             else:
                 self.reasoning_config = _cli_reasoning
+        # Keep the user-selected primary separate from the mutable active
+        # transport. A startup AuthError may temporarily construct the turn on
+        # a fallback, but it must not redefine which route the next turn
+        # retries or what AIAgent records as its logical primary.
+        self._configured_primary_runtime = {
+            "model": self.model,
+            "provider": self.requested_provider,
+            "reasoning_config": copy.deepcopy(self.reasoning_config),
+        }
+        self._startup_auth_fallback_active = False
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )

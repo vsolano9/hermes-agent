@@ -9871,37 +9871,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cached agent's working fallback for that turn.  Only a successful read
         that genuinely lacks the key clears the chain.
         """
-        try:
-            from hermes_cli.config import read_user_config_raw
-            cfg_path = _hermes_home / "config.yaml"
-            if not cfg_path.exists():
-                self._fallback_model = None
-                return self._fallback_model
-            # Raw primitive (raises on parse failure) is required here: the
-            # canonical fail-open loader would return {} on a torn mid-edit
-            # write and WIPE the last known-good chain. The overlay/expansion
-            # below fixes the managed-scope/${VAR} drift without losing that.
-            cfg = read_user_config_raw(cfg_path)
-            try:
-                from hermes_cli import managed_scope
-                cfg = managed_scope.apply_managed_overlay(cfg)
-            except Exception:
-                pass
-            try:
-                from hermes_cli.config import _expand_env_vars
-                expanded = _expand_env_vars(cfg)
-                if isinstance(expanded, dict):
-                    cfg = expanded
-            except Exception:
-                pass
-        except Exception:
-            # Transient failure — keep last known-good chain.
-            logger.debug(
-                "fallback_providers refresh: config.yaml read failed; "
-                "keeping last known-good chain", exc_info=True,
-            )
-            return self._fallback_model
-        self._fallback_model = get_fallback_chain(cfg) or None
+        from hermes_cli.fallback_config import refresh_fallback_chain
+
+        refreshed = refresh_fallback_chain(
+            _hermes_home / "config.yaml",
+            self._fallback_model,
+        )
+        self._fallback_model = refreshed or None
         return self._fallback_model
 
     @staticmethod
@@ -9914,31 +9890,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         replace the chain so mid-uptime ``fallback_providers`` edits take
         effect without requiring a gateway restart (#60955).
         """
-        if agent is None:
-            return
-        new_chain = list(chain or [])
-        rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
-        if (
-            getattr(agent, "_fallback_activated", False)
-            and rate_limited_until > time.monotonic()
-        ):
-            return
-        old_chain = list(getattr(agent, "_fallback_chain", []) or [])
-        agent._fallback_chain = new_chain
-        agent._fallback_model = new_chain[0] if new_chain else None
-        if not getattr(agent, "_fallback_activated", False):
-            agent._fallback_index = 0
-        # A config edit signals the user changed something — drop the
-        # session-scoped unavailability memo so re-configured entries
-        # (e.g. credentials added mid-uptime for a previously-failing
-        # provider) get retried instead of staying suppressed for the
-        # cached agent's lifetime.  Only on actual content change, so
-        # the per-message no-op refresh keeps the memo's rate-limiting
-        # benefit (#60955).
-        if new_chain != old_chain:
-            unavailable = getattr(agent, "_unavailable_fallback_keys", None)
-            if unavailable:
-                unavailable.clear()
+        from hermes_cli.fallback_config import apply_fallback_chain_to_agent
+
+        apply_fallback_chain_to_agent(agent, chain)
 
     def _snapshot_running_agents(self) -> Dict[str, Any]:
         return {

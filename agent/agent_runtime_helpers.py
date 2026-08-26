@@ -1525,6 +1525,13 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_index = 0
         return False
 
+    if (agent._primary_runtime or {}).get("restorable") is False:
+        # A CLI startup AuthError can construct an agent directly on a
+        # fallback before any usable primary client exists. The CLI retries
+        # the configured primary at its next turn boundary; restoring the
+        # identity here would mix it with fallback transport credentials.
+        return False
+
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 

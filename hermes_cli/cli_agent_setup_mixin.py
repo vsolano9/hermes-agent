@@ -14,6 +14,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 
 from __future__ import annotations
 
+import copy
 import sys
 
 from rich.markup import escape as _escape
@@ -23,6 +24,48 @@ from utils import base_url_host_matches
 
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
+
+    def _refresh_fallback_model(self) -> list[dict]:
+        """Refresh the long-lived CLI's chain at a between-turn boundary."""
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli.fallback_config import (
+            apply_fallback_chain_to_agent,
+            refresh_fallback_chain,
+        )
+
+        refreshed = refresh_fallback_chain(
+            get_hermes_home() / "config.yaml",
+            self._fallback_model,
+        )
+        self._fallback_model = refreshed
+        apply_fallback_chain_to_agent(getattr(self, "agent", None), refreshed)
+        return refreshed
+
+    def _preserve_configured_primary_runtime(self, agent) -> None:
+        """Keep startup fallback transport separate from primary identity."""
+
+        if not getattr(self, "_startup_auth_fallback_active", False):
+            return
+        configured = self._configured_primary_runtime
+        primary = getattr(agent, "_primary_runtime", None)
+        if not isinstance(primary, dict):
+            return
+        primary.update(
+            {
+                "model": configured["model"],
+                "provider": configured["provider"],
+                "requested_provider": configured["provider"],
+                "reasoning_config": copy.deepcopy(
+                    configured["reasoning_config"]
+                ),
+                # Resolution failed before a usable primary client could be
+                # built. The CLI retries resolution next turn; the in-agent
+                # restore path must not combine this identity with fallback
+                # transport credentials in the meantime.
+                "restorable": False,
+            }
+        )
 
     def _ensure_runtime_credentials(self) -> bool:
         """
@@ -37,11 +80,28 @@ class CLIAgentSetupMixin:
             format_runtime_provider_error,
         )
 
+        # AgentGrid keeps ``hermes --yolo`` alive for hours. Re-read the chain
+        # before resolving any startup fallback so an on-disk reorder reaches
+        # this turn as one complete snapshot. The apply helper refuses to
+        # disturb an in-flight cooldown-owned fallback.
+        self._refresh_fallback_model()
+
+        configured = self._configured_primary_runtime
+        if not self._startup_auth_fallback_active:
+            configured.update(
+                {
+                    "model": self.model,
+                    "provider": self.requested_provider,
+                    "reasoning_config": copy.deepcopy(self.reasoning_config),
+                }
+            )
+
         _primary_exc = None
+        _used_startup_fallback = False
         runtime = None
         try:
             runtime = resolve_runtime_provider(
-                requested=self.requested_provider,
+                requested=configured["provider"],
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
             )
@@ -73,6 +133,8 @@ class CLIAgentSetupMixin:
                             _primary_exc, _fb_provider, _fb_model,
                         )
                         _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
+                        _used_startup_fallback = True
+                        self._startup_auth_fallback_active = True
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
                         _primary_exc = None
@@ -84,6 +146,18 @@ class CLIAgentSetupMixin:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
             ChatConsole().print(f"[bold red]{message}[/]")
             return False
+
+        if _used_startup_fallback or not self._startup_auth_fallback_active:
+            # Normal primary resolution; no identity restoration needed.
+            pass
+        else:
+            # The configured primary recovered on this turn. Restore its
+            # logical fields before route-signature comparison rebuilds the
+            # active AIAgent on the primary transport.
+            self.model = configured["model"]
+            self.requested_provider = configured["provider"]
+            self.reasoning_config = copy.deepcopy(configured["reasoning_config"])
+            self._startup_auth_fallback_active = False
 
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")
@@ -542,6 +616,7 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
             )
+            self._preserve_configured_primary_runtime(self.agent)
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

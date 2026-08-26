@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
 from typing import Any
 
 
@@ -99,3 +101,66 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             chain.append(entry)
 
     return chain
+
+
+def refresh_fallback_chain(
+    config_path: Path,
+    previous_chain: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Read one complete fallback-chain snapshot from ``config_path``.
+
+    A missing config is an authoritative empty chain. A transient read or
+    parse failure keeps a fresh copy of the last known-good chain. Managed
+    overlays and environment expansion match the gateway runtime loader.
+    """
+
+    previous = [dict(entry) for entry in (previous_chain or [])]
+    try:
+        if not config_path.exists():
+            return []
+        from hermes_cli.config import read_user_config_raw
+
+        config = read_user_config_raw(config_path)
+        try:
+            from hermes_cli import managed_scope
+
+            config = managed_scope.apply_managed_overlay(config)
+        except Exception:
+            pass
+        try:
+            from hermes_cli.config import _expand_env_vars
+
+            expanded = _expand_env_vars(config)
+            if isinstance(expanded, dict):
+                config = expanded
+        except Exception:
+            pass
+    except Exception:
+        return previous
+    return get_fallback_chain(config)
+
+
+def apply_fallback_chain_to_agent(
+    agent: Any,
+    chain: list[dict[str, Any]] | None,
+) -> None:
+    """Apply a whole chain between turns without disrupting live cooldown."""
+
+    if agent is None:
+        return
+    new_chain = [dict(entry) for entry in (chain or [])]
+    rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
+    if (
+        getattr(agent, "_fallback_activated", False)
+        and rate_limited_until > time.monotonic()
+    ):
+        return
+    old_chain = list(getattr(agent, "_fallback_chain", []) or [])
+    agent._fallback_chain = new_chain
+    agent._fallback_model = new_chain[0] if new_chain else None
+    if not getattr(agent, "_fallback_activated", False):
+        agent._fallback_index = 0
+    if new_chain != old_chain:
+        unavailable = getattr(agent, "_unavailable_fallback_keys", None)
+        if unavailable:
+            unavailable.clear()
