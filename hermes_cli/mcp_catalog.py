@@ -78,7 +78,7 @@ class AuthSpec:
 
 @dataclass
 class TransportSpec:
-    type: str  # "stdio" | "http"
+    type: str  # "stdio" | "http" | reserved host-owned transports
     command: Optional[str] = None
     args: List[str] = field(default_factory=list)
     url: Optional[str] = None
@@ -228,8 +228,26 @@ def _parse_manifest(path: Path) -> CatalogEntry:
     if not isinstance(transport_raw, dict):
         raise CatalogError(f"{path}: 'transport' must be a mapping")
     t_type = transport_raw.get("type")
-    if t_type not in ("stdio", "http"):
-        raise CatalogError(f"{path}: transport.type must be 'stdio' or 'http'")
+    if t_type not in ("stdio", "http", "codex_app_server"):
+        raise CatalogError(
+            f"{path}: transport.type must be 'stdio', 'http', or the "
+            "reserved 'codex_app_server' host transport"
+        )
+    if t_type == "codex_app_server":
+        canonical_manifest = (
+            _catalog_root() / "codex-computer-use" / "manifest.yaml"
+        ).resolve()
+        if name != "codex-computer-use" or path.resolve() != canonical_manifest:
+            raise CatalogError(
+                f"{path}: codex_app_server is reserved for the shipped "
+                "codex-computer-use entry"
+            )
+        forbidden = {"command", "args", "env", "url"}.intersection(transport_raw)
+        if forbidden:
+            raise CatalogError(
+                f"{path}: codex_app_server must be commandless; forbidden "
+                f"transport fields: {', '.join(sorted(forbidden))}"
+            )
     args = transport_raw.get("args") or []
     if not isinstance(args, list):
         raise CatalogError(f"{path}: transport.args must be a list")
@@ -354,6 +372,9 @@ def _parse_manifest(path: Path) -> CatalogEntry:
         capabilities_digest = compatibility.get("capabilities_sha256")
         count = compatibility.get("tool_count")
         tools_only = compatibility.get("tools_only")
+        app_server_catalog_digest = compatibility.get(
+            "app_server_catalog_sha256"
+        )
         if (
             not isinstance(digest, str)
             or not re.fullmatch(r"[0-9a-f]{64}", digest)
@@ -371,6 +392,14 @@ def _parse_manifest(path: Path) -> CatalogEntry:
             "tool_count": count,
             "tools_only": tools_only,
         }
+        if app_server_catalog_digest is not None:
+            if not isinstance(app_server_catalog_digest, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", app_server_catalog_digest
+            ):
+                raise CatalogError(f"{path}: invalid compatibility contract")
+            compatibility["app_server_catalog_sha256"] = (
+                app_server_catalog_digest
+            )
 
     suggest: Optional[SuggestSpec] = None
     suggest_raw = data.get("suggest")
@@ -683,6 +712,8 @@ def _build_server_config(
             from hermes_cli.mcp_config import _bearer_auth_headers
 
             cfg["headers"] = _bearer_auth_headers(entry.name)
+    elif t.type == "codex_app_server":
+        cfg["transport"] = "codex_app_server"
     if entry.trust is not None:
         cfg["trust"] = entry.trust
     if t.supports_parallel_tool_calls:

@@ -40,21 +40,18 @@ def _clear_test_alias_state() -> None:
 
 
 def _cua_config():
-    launcher = (
-        Path(mcp_tool.__file__).resolve().parents[1]
-        / "optional-mcps" / "codex-computer-use" / "launcher.py"
-    )
     tools = [
         "list_apps", "get_app_state", "click", "perform_secondary_action",
         "set_value", "select_text", "scroll", "drag", "press_key", "type_text",
     ]
     return {
-        "command": str(launcher),
+        "transport": "codex_app_server",
         "trust": "untrusted",
         "supports_parallel_tool_calls": False,
         "single_writer": True,
         "minimal_env": True,
         "compatibility": {
+            "app_server_catalog_sha256": "f710c1eacba2487b5547ddafe8aeb616268850ea4501df3a4a047552a1608a40",
             "tools_sha256": "dd485a140f5fbebe14147fb3ee2ed3914618b3484964efe02262b2479b322f1d",
             "capabilities_sha256": "52aa21370a62916d63adb5718fa1be519ec0fe4390136bf36e701be54e5582a5",
             "tool_count": 10,
@@ -231,7 +228,7 @@ def test_successful_state_result_exposes_and_records_stable_digest():
     ) is None
 
 
-def test_canonical_launcher_aliases_share_state_and_exact_action_grant(monkeypatch):
+def test_canonical_adapter_aliases_share_state_and_exact_action_grant(monkeypatch):
     registry = ToolRegistry()
     with patch("tools.registry.registry", registry), \
          patch("tools.mcp_tool._MCP_AVAILABLE", True):
@@ -265,7 +262,7 @@ def test_canonical_launcher_aliases_share_state_and_exact_action_grant(monkeypat
     ) is None
 
 
-def test_state_digest_is_decorated_for_canonical_launcher_alias() -> None:
+def test_state_digest_is_decorated_for_canonical_adapter_alias() -> None:
     registry = ToolRegistry()
     with patch("tools.registry.registry", registry), \
          patch("tools.mcp_tool._MCP_AVAILABLE", True):

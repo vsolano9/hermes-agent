@@ -840,7 +840,9 @@ class TestShippedCatalog:
             entry = _parse_manifest(m)
             assert entry.name
             assert entry.description
-            assert entry.transport.type in ("stdio", "http")
+            assert entry.transport.type in (
+                "stdio", "http", "codex_app_server"
+            )
 
     def test_all_shipped_manifests_are_version_locked(self, monkeypatch):
         """Contract: catalog entries follow the same supply-chain rules as

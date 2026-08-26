@@ -9,6 +9,8 @@ checked-in authority.
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 from types import SimpleNamespace
 from typing import NamedTuple
 
@@ -19,6 +21,10 @@ CODEX_CUA_TOOL_NAMES = (
     "list_apps", "get_app_state", "click", "perform_secondary_action",
     "set_value", "select_text", "scroll", "drag", "press_key", "type_text",
 )
+CODEX_CUA_APP_SERVER_NAME = "computer-use"
+CODEX_CUA_APP_SERVER_PLUGIN_ID = "computer-use@openai-bundled"
+# Canonical digest over the full thread-scoped App Server inventory below.
+CODEX_CUA_APP_SERVER_CATALOG_SHA256 = "f710c1eacba2487b5547ddafe8aeb616268850ea4501df3a4a047552a1608a40"
 
 
 class PinnedSurface(NamedTuple):
@@ -135,6 +141,91 @@ _CODEX_CUA_TOOLS = (
         "annotations": _annotations(False),
     },
 )
+
+
+def expected_app_server_tools() -> dict[str, dict]:
+    """Return exact Tool objects expected from mcpServerStatus/list."""
+
+    tools = {}
+    for template in _CODEX_CUA_TOOLS:
+        tools[template["name"]] = {
+            "name": template["name"],
+            "description": template["description"],
+            "inputSchema": deepcopy(template["inputSchema"]),
+            "annotations": deepcopy(template["annotations"]),
+            "title": None,
+            "outputSchema": None,
+            "icons": None,
+            "_meta": None,
+        }
+    return tools
+
+
+def canonical_app_server_catalog(row: object) -> bytes:
+    """Canonicalize only an exact generated-schema-valid CUA inventory.
+
+    Unknown fields fail closed so a future protocol addition cannot silently
+    disappear from the attested digest.
+    """
+
+    if not isinstance(row, dict):
+        raise ValueError("Computer Use catalog row must be an object")
+    row_keys = {
+        "authStatus", "name", "pluginId", "resourceTemplates", "resources",
+        "serverInfo", "tools",
+    }
+    if set(row) - row_keys:
+        raise ValueError("Computer Use catalog row has unknown fields")
+    if (
+        row.get("name") != CODEX_CUA_APP_SERVER_NAME
+        or row.get("pluginId") != CODEX_CUA_APP_SERVER_PLUGIN_ID
+        or row.get("authStatus") != "unsupported"
+        or row.get("resources") != []
+        or row.get("resourceTemplates") != []
+    ):
+        raise ValueError("Computer Use catalog identity or status drifted")
+    # The attested 0.149 row has no serverInfo. Accepting an arbitrary future
+    # identity here without hashing it would make identity/version drift
+    # invisible, so require the current generated value exactly.
+    if row.get("serverInfo") is not None:
+        raise ValueError("Computer Use serverInfo identity drifted")
+    raw_tools = row.get("tools")
+    expected = expected_app_server_tools()
+    if not isinstance(raw_tools, dict) or set(raw_tools) != set(expected):
+        raise ValueError("Computer Use tool set drifted")
+    normalized_tools = {}
+    allowed_tool_keys = {
+        "_meta", "annotations", "description", "icons", "inputSchema",
+        "name", "outputSchema", "title",
+    }
+    for name in CODEX_CUA_TOOL_NAMES:
+        tool = raw_tools.get(name)
+        if not isinstance(tool, dict) or set(tool) - allowed_tool_keys:
+            raise ValueError("Computer Use tool contract has unknown fields")
+        normalized = {
+            key: deepcopy(tool.get(key)) for key in sorted(allowed_tool_keys)
+        }
+        if normalized != {
+            key: expected[name][key] for key in sorted(allowed_tool_keys)
+        }:
+            raise ValueError(f"Computer Use tool contract drifted: {name}")
+        normalized_tools[name] = normalized
+    canonical = {
+        "authStatus": "unsupported",
+        "name": CODEX_CUA_APP_SERVER_NAME,
+        "pluginId": CODEX_CUA_APP_SERVER_PLUGIN_ID,
+        "resourceTemplates": [],
+        "resources": [],
+        "tools": normalized_tools,
+    }
+    return json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def app_server_catalog_sha256(row: object) -> str:
+    return hashlib.sha256(canonical_app_server_catalog(row)).hexdigest()
 
 
 def get_surface(tools_sha256: object, capabilities_sha256: object) -> PinnedSurface | None:

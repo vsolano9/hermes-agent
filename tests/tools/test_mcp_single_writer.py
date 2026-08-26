@@ -211,22 +211,19 @@ def test_writer_lock_missing_capability_key_fails_closed_without_identity_lookup
     assert "missing-key" not in mcp_tool._single_writer_process_locks
 
 
-def test_codex_cua_launcher_identity_makes_server_aliases_share_lock(
+def test_codex_cua_adapter_identity_makes_server_aliases_share_lock(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
         mcp_tool, "_machine_account_home_for_lock", lambda: tmp_path
     )
     compatibility = {
+        "app_server_catalog_sha256": "f710c1eacba2487b5547ddafe8aeb616268850ea4501df3a4a047552a1608a40",
         "tools_sha256": "dd485a140f5fbebe14147fb3ee2ed3914618b3484964efe02262b2479b322f1d",
         "capabilities_sha256": "52aa21370a62916d63adb5718fa1be519ec0fe4390136bf36e701be54e5582a5",
         "tool_count": 10,
         "tools_only": True,
     }
-    launcher = str(
-        Path(mcp_tool.__file__).resolve().parents[1]
-        / "optional-mcps" / "codex-computer-use" / "launcher.py"
-    )
     tools = {
         "include": [
             "list_apps", "get_app_state", "click", "perform_secondary_action",
@@ -237,7 +234,7 @@ def test_codex_cua_launcher_identity_makes_server_aliases_share_lock(
     }
     cua_config = {
         "enabled": False,
-        "command": launcher,
+        "transport": "codex_app_server",
         "single_writer": True,
         "supports_parallel_tool_calls": False,
         "minimal_env": True,

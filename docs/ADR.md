@@ -1,5 +1,114 @@
 # Architecture Decision Records
 
+## 2026-08-26: Broker Codex Computer Use through the signed Codex app-server daemon
+
+Status: Accepted
+
+Context:
+Hermes publishes a checked-in, exact ten-tool Computer Use surface and applies
+its own untrusted-tool approvals, exact-action grants, state digests,
+single-writer lease, and result sanitation. The previous transport executed
+the installed `SkyComputerUseClient` directly. On macOS, that gives the
+Computer Use service an unsigned Hermes/Python ancestry instead of the signed
+OpenAI host ancestry that owns its privacy grants. It can therefore trigger
+repeated Screen Recording prompts even when the OpenAI application has already
+been granted access.
+
+The signed Codex CLI bundled in ChatGPT 0.149 exposes a maintained app-server
+daemon with a Unix-socket WebSocket transport. Its generated v2 protocol has
+the three model-free calls needed here: `mcpServerStatus/list`,
+`mcpServer/tool/call`, and `thread/delete`. `thread/start` accepts
+`ephemeral: true`. None of these operations requires `turn/start`, and Hermes
+must never invoke a Codex model to execute a Computer Use call.
+
+Decision:
+- Keep Claude Opus as the sole orchestrator. Route each granted Computer Use
+  operation through a new `CodexCUABroker.call(...)` boundary that hides
+  daemon discovery, trust validation, one fresh socket connection, one
+  ephemeral thread, exact catalog attestation, the tool call, and mandatory
+  thread deletion.
+- Resolve only `/Applications/ChatGPT.app/Contents/Resources/codex`. Before a
+  daemon start, verify the ChatGPT bundle and CLI designated requirements for
+  OpenAI team `2DC432GLL2`, reject symbolic links, unsafe ownership or mode on
+  every path component, and recheck the same vnode identities immediately
+  before execution.
+- Treat the OS account's `CODEX_HOME/app-server-control` directory and Unix
+  socket as a security boundary. Reject links, wrong ownership, permissive
+  modes, non-socket endpoints, and version/catalog drift. Connect the raw Unix
+  socket, read macOS `LOCAL_PEERPID`, require its `proc_pidpath` to equal the
+  verified embedded CLI, and bind that live PID through Security.framework to
+  the exact OpenAI designated requirement before the WebSocket handshake.
+  Start/readiness work is coordinated by an account-global lock and a minimal
+  environment. The shared daemon outlives Hermes panes and is not stopped
+  during MCP shutdown.
+- For every call, connect directly to the Unix socket with WebSocket framing,
+  initialize, start an ephemeral thread, request the complete MCP status
+  catalog, and attest the exact CUA plugin id and immutable ten-tool digest
+  before sending `mcpServer/tool/call`. Once `thread/start` returns its id,
+  delete the thread in `finally` on success, server error, timeout, or
+  cancellation. If creation itself loses its response before the id is known,
+  close the fresh connection and send no tool call; the protocol exposes no
+  safe correlated thread identity to delete.
+- ChatGPT Codex `0.149.0-alpha.4.3`'s generated
+  `ListMcpServerStatusResponse` has no `runtimeStatus` field. Require its real
+  full thread-scoped shape instead: one exact server/plugin row, explicit
+  `authStatus: unsupported`, zero resources/templates, all ten complete Tool
+  contracts and annotations, and no unknown row/tool fields. The subsequent
+  live `mcpServer/tool/call` is the operational proof. Unknown future fields
+  fail closed rather than disappearing from the catalog digest.
+- Bound catalog pages and rows and share one absolute deadline across binary
+  attestation, daemon readiness, initialization, thread creation, catalog, and
+  tool dispatch. Event queues are bounded; overflow makes the transport
+  terminal. The broker promptly rejects every server-initiated request because
+  Hermes's own grants and high-impact confirmation are the only approval
+  authority.
+- Keep all existing Hermes gates before broker work: trust/confirmation,
+  exact grant/state checks, account-global single-writer flock, and circuit
+  breaker. Reuse the existing MCP result renderer so text, images, audio,
+  resources, structured content, metadata, errors, and trusted state hashes
+  retain one contract. Validate App Server results through the same strict MCP
+  SDK `CallToolResult` content union before rendering.
+- Never fall back to the direct Sky executable. Never use `codex mcp-server`;
+  it is a deprecated, model-mediated route. Do not retry after a frame may
+  have been accepted. The current broker performs no automatic retry. A future
+  bounded retry may be added only for an authenticated, explicit
+  pre-execution overload response while the existing lease remains held.
+- Represent the host config with reserved transport type
+  `codex_app_server`. The entry is commandless and accepts no args, env, or
+  URL. Only the shipped exact catalog entry may claim this transport and the
+  `openai-codex-cua` identity.
+
+Alternatives considered:
+- Keep the direct Sky launcher. Rejected because it cannot supply the signed
+  OpenAI process ancestry that macOS privacy authorization expects.
+- Spawn `codex app-server proxy` for every call and keep stdio semantics.
+  Rejected because it adds one child/process pipe per call, expands lifecycle
+  and retry ambiguity, and bypasses the maintained shared-daemon boundary.
+- Expose app-server/thread orchestration directly from `mcp_tool.py`.
+  Rejected because callers would need to understand version checks, socket
+  trust, ephemeral-thread cleanup, catalog attestation, and protocol ambiguity.
+  The broker is a deeper and safer boundary.
+
+Consequences:
+- Hermes gains Codex's supported macOS Computer Use host ancestry without
+  changing its orchestrator or delegating the decision to a Codex model.
+- A Computer Use call fails closed if the ChatGPT/Codex installation, daemon,
+  connected peer, socket, protocol version, plugin identity, result envelope,
+  or tool catalog drifts.
+- The first granted call may pay daemon-readiness latency; later calls reuse
+  one account-global daemon but still receive isolated connections and
+  ephemeral threads.
+- The implementation is macOS-only and intentionally has no compatibility
+  fallback to an unsigned or model-mediated launcher.
+- The cooperative OS account and the Hermes code/configuration it loads are
+  trusted. Code already executing maliciously as that account can alter this
+  Python process and its files directly and is outside this boundary. The
+  vnode/codesign checks mitigate installation drift and nonconcurrent
+  replacement; live peer attestation mitigates stale or replaced endpoints.
+  They do not claim to eliminate the pathname verify-to-exec race after the
+  account itself is compromised; macOS provides no supported `fexecve` or
+  atomic Security.framework validate-and-launch primitive for this CLI.
+
 ## 2026-07-13: Scope plugin manager state by Hermes home/profile (keyed cache)
 
 Status: Accepted

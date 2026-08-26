@@ -1,9 +1,9 @@
 """Codex app-server JSON-RPC client.
 
 Speaks the protocol documented in codex-rs/app-server/README.md (codex 0.125+).
-Transport is newline-delimited JSON-RPC 2.0 over stdio: spawn `codex app-server`,
-do an `initialize` handshake, then drive `thread/start` + `turn/start` and
-consume streaming `item/*` notifications until `turn/completed`.
+Transport is JSON-RPC 2.0 over either newline-delimited stdio or a Unix-domain
+WebSocket. The stdio connection preserves the optional model runtime; the UDS
+connection lets trusted local clients share a separately managed app-server.
 
 This module is the wire-level speaker only. Higher-level concerns (event
 projection into Hermes' display, approval bridging, transcript projection into
@@ -19,17 +19,19 @@ from __future__ import annotations
 import json
 import os
 import queue
+import socket
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Protocol
 
 from tools.environments.local import hermes_subprocess_env
 
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+_DEFAULT_EVENT_QUEUE_LIMIT = 256
 
 
 @dataclass
@@ -44,6 +46,14 @@ class CodexAppServerError(RuntimeError):
         return f"codex app-server error {self.code}: {self.message}"
 
 
+class CodexAppServerTransportError(RuntimeError):
+    """Raised when transport loss makes a pending response unknowable."""
+
+
+def _reject_nonfinite_json(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
 @dataclass
 class _Pending:
     queue: queue.Queue
@@ -51,8 +61,167 @@ class _Pending:
     sent_at: float = field(default_factory=time.time)
 
 
+class CodexAppServerConnection(Protocol):
+    """Text-frame connection used by :class:`CodexAppServerClient`."""
+
+    def send_text(self, payload: str) -> None: ...
+
+    def recv_text(self) -> Optional[str]: ...
+
+    def close(self, timeout: float = 3.0) -> None: ...
+
+    def is_alive(self) -> bool: ...
+
+    def stderr_tail(self, n: int = 20) -> list[str]: ...
+
+
+class StdioCodexAppServerConnection:
+    """Newline-delimited JSON connection over a spawned app-server process."""
+
+    def __init__(self, process: subprocess.Popen) -> None:
+        self.process = process
+        self._stderr_lines: list[str] = []
+        self._stderr_lock = threading.Lock()
+        self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_reader.start()
+
+    def send_text(self, payload: str) -> None:
+        if self.process.stdin is None:
+            raise RuntimeError("codex app-server stdin not available")
+        try:
+            self.process.stdin.write((payload + "\n").encode("utf-8"))
+            self.process.stdin.flush()
+        except (BrokenPipeError, ValueError) as exc:
+            raise RuntimeError(
+                f"codex app-server stdin closed unexpectedly: {exc}"
+            ) from exc
+
+    def recv_text(self) -> Optional[str]:
+        if self.process.stdout is None:
+            return None
+        line = self.process.stdout.readline()
+        if not line:
+            return None
+        return line.decode("utf-8", "replace").strip()
+
+    def close(self, timeout: float = 3.0) -> None:
+        try:
+            if self.process.stdin and not self.process.stdin.closed:
+                self.process.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                self.process.kill()
+                self.process.wait(timeout=1.0)
+            except Exception:
+                pass
+
+    def is_alive(self) -> bool:
+        return self.process.poll() is None
+
+    def stderr_tail(self, n: int = 20) -> list[str]:
+        with self._stderr_lock:
+            return list(self._stderr_lines[-n:])
+
+    def record_diagnostic(self, line: str) -> None:
+        with self._stderr_lock:
+            self._stderr_lines.append(line)
+            if len(self._stderr_lines) > 500:
+                self._stderr_lines = self._stderr_lines[-500:]
+
+    def _read_stderr(self) -> None:
+        if self.process.stderr is None:
+            return
+        try:
+            for line in iter(self.process.stderr.readline, b""):
+                if not line:
+                    break
+                self.record_diagnostic(line.decode("utf-8", "replace").rstrip())
+        except Exception:  # pragma: no cover - diagnostic path only
+            pass
+
+
+class UnixWebSocketCodexAppServerConnection:
+    """JSON text-frame connection to an app-server Unix WebSocket."""
+
+    def __init__(
+        self,
+        socket_path: str,
+        *,
+        open_timeout: float = 10.0,
+        close_timeout: float = 3.0,
+        max_size: int = 16 * 1024 * 1024,
+        peer_validator: Optional[Callable[[socket.socket], None]] = None,
+    ) -> None:
+        from websockets.sync.client import unix_connect
+
+        raw_socket = None
+        try:
+            if peer_validator is not None:
+                raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                raw_socket.settimeout(open_timeout)
+                raw_socket.connect(socket_path)
+                peer_validator(raw_socket)
+                raw_socket.settimeout(None)
+            self._websocket = unix_connect(
+                None if raw_socket is not None else socket_path,
+                sock=raw_socket,
+                uri="ws://localhost/rpc",
+                proxy=None,
+                compression=None,
+                open_timeout=open_timeout,
+                close_timeout=close_timeout,
+                max_size=max_size,
+            )
+        except BaseException:
+            if raw_socket is not None:
+                raw_socket.close()
+            raise
+        self._closed = False
+
+    def send_text(self, payload: str) -> None:
+        if self._closed:
+            raise RuntimeError("codex app-server WebSocket is closed")
+        self._websocket.send(payload)
+
+    def recv_text(self) -> Optional[str]:
+        if self._closed:
+            return None
+        try:
+            payload = self._websocket.recv()
+        except Exception:
+            self._closed = True
+            raise
+        if payload is None:
+            return None
+        if not isinstance(payload, str):
+            raise RuntimeError("codex app-server sent a binary WebSocket frame")
+        return payload
+
+    def close(self, timeout: float = 3.0) -> None:
+        del timeout  # close_timeout is fixed when websockets opens the connection.
+        if self._closed:
+            return
+        self._closed = True
+        self._websocket.close()
+
+    def is_alive(self) -> bool:
+        return not self._closed
+
+    def stderr_tail(self, n: int = 20) -> list[str]:
+        del n
+        return []
+
+    def record_diagnostic(self, line: str) -> None:
+        del line
+
+
 class CodexAppServerClient:
-    """Minimal JSON-RPC 2.0 client for `codex app-server` over stdio.
+    """Minimal synchronous JSON-RPC 2.0 client for `codex app-server`.
 
     Threading model:
       - Spawning thread (caller) drives request/response pairs synchronously.
@@ -74,6 +243,9 @@ class CodexAppServerClient:
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        connection: Optional[CodexAppServerConnection] = None,
+        reject_server_requests: bool = False,
+        event_queue_limit: int = _DEFAULT_EVENT_QUEUE_LIMIT,
     ) -> None:
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
@@ -87,18 +259,17 @@ class CodexAppServerClient:
         # centralized helper so Tier-1 + dynamic-internal secrets are always
         # stripped while provider creds still flow, matching copilot_acp_client
         # (#29157 sibling spawn-site gap).
-        spawn_env = hermes_subprocess_env(inherit_credentials=True)
-        if env:
-            spawn_env.update(env)
-        if codex_home:
-            spawn_env["CODEX_HOME"] = codex_home
-
         app_server_args = list(extra_args or [])
         # Kanban workers must be able to write their handoff/status back to
         # the board DB, which lives outside the per-task workspace. Keep the
         # Codex sandbox on, but add the Kanban root as the only extra writable
         # root. Without this, codex-runtime workers finish their actual work
         # but crash/block when kanban_complete/kanban_block writes SQLite.
+        spawn_env = hermes_subprocess_env(inherit_credentials=True)
+        if env:
+            spawn_env.update(env)
+        if codex_home:
+            spawn_env["CODEX_HOME"] = codex_home
         if spawn_env.get("HERMES_KANBAN_TASK"):
             kanban_db = spawn_env.get("HERMES_KANBAN_DB")
             kanban_root = (
@@ -131,29 +302,35 @@ class CodexAppServerClient:
         # (#56747). Hide-only — stdio pipes stay intact for the app-server wire.
         from hermes_cli._subprocess_compat import windows_hide_flags
 
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            env=spawn_env,
-            creationflags=windows_hide_flags(),
-        )
+        if connection is None:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                env=spawn_env,
+                creationflags=windows_hide_flags(),
+            )
+            connection = StdioCodexAppServerConnection(proc)
+        self._connection = connection
+        # Compatibility for callers which inspect the optional runtime child.
+        self._proc = getattr(connection, "process", None)
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
-        self._notifications: queue.Queue = queue.Queue()
-        self._server_requests: queue.Queue = queue.Queue()
-        self._stderr_lines: list[str] = []
-        self._stderr_lock = threading.Lock()
+        if not isinstance(event_queue_limit, int) or event_queue_limit <= 0:
+            raise ValueError("event_queue_limit must be a positive integer")
+        self._notifications: queue.Queue = queue.Queue(maxsize=event_queue_limit)
+        self._server_requests: queue.Queue = queue.Queue(maxsize=event_queue_limit)
+        self._reject_server_requests = reject_server_requests
+        self._send_lock = threading.Lock()
+        self._close_lock = threading.Lock()
         self._closed = False
         self._initialized = False
 
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
-        self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
-        self._stderr_reader.start()
 
     # ---------- lifecycle ----------
 
@@ -183,24 +360,12 @@ class CodexAppServerClient:
         return result
 
     def close(self, timeout: float = 3.0) -> None:
-        """Close stdin and wait for the subprocess to exit, escalating to kill."""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            if self._proc.stdin and not self._proc.stdin.closed:
-                self._proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self._proc.terminate()
-            self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                self._proc.kill()
-                self._proc.wait(timeout=1.0)
-            except Exception:
-                pass
+        """Close the underlying transport without leaking its resources."""
+        self._terminate_transport(
+            CodexAppServerTransportError("codex app-server client closed"),
+            timeout=timeout,
+            suppress_close_error=False,
+        )
 
     def __enter__(self) -> "CodexAppServerClient":
         return self
@@ -222,7 +387,12 @@ class CodexAppServerClient:
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[rid] = _Pending(queue=q, method=method)
-        self._send({"id": rid, "method": method, "params": params or {}})
+        try:
+            self._send({"id": rid, "method": method, "params": params or {}})
+        except BaseException:
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise
         try:
             msg = q.get(timeout=timeout)
         except queue.Empty:
@@ -231,6 +401,8 @@ class CodexAppServerClient:
             raise TimeoutError(
                 f"codex app-server method {method!r} timed out after {timeout}s"
             )
+        if isinstance(msg, BaseException):
+            raise msg
         if "error" in msg:
             err = msg["error"]
             raise CodexAppServerError(
@@ -282,11 +454,10 @@ class CodexAppServerClient:
 
     def stderr_tail(self, n: int = 20) -> list[str]:
         """Return last n lines of codex's stderr (for error reports)."""
-        with self._stderr_lock:
-            return list(self._stderr_lines[-n:])
+        return self._connection.stderr_tail(n)
 
     def is_alive(self) -> bool:
-        return self._proc.poll() is None
+        return self._connection.is_alive()
 
     # ---------- internals ----------
 
@@ -301,46 +472,120 @@ class CodexAppServerClient:
     def _send(self, obj: dict) -> None:
         if self._closed:
             raise RuntimeError("codex app-server client is closed")
-        if self._proc.stdin is None:
-            raise RuntimeError("codex app-server stdin not available")
         try:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
-        except (BrokenPipeError, ValueError) as exc:
-            raise RuntimeError(
-                f"codex app-server stdin closed unexpectedly: {exc}"
+            payload = json.dumps(obj, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("codex app-server request is not JSON serializable") from exc
+        try:
+            with self._send_lock:
+                self._connection.send_text(payload)
+        except Exception as exc:
+            # WebSocket ConnectionClosed/OSError and stdio pipe failures can
+            # occur after some or all frame bytes were accepted. Classify
+            # every transport write failure as ambiguous at the wire boundary.
+            raise CodexAppServerTransportError(
+                "codex app-server transport failed while sending a request"
             ) from exc
 
     def _read_stdout(self) -> None:
-        if self._proc.stdout is None:
-            return
+        failure: Optional[CodexAppServerTransportError] = None
         try:
-            for line in iter(self._proc.stdout.readline, b""):
-                if not line:
+            while True:
+                line = self._connection.recv_text()
+                if line is None:
+                    if not self._closed:
+                        failure = CodexAppServerTransportError(
+                            "codex app-server connection closed before response"
+                        )
                     break
-                line = line.strip()
                 if not line:
                     continue
                 try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    # Non-JSON output is unexpected on stdout; tracing belongs
-                    # on stderr. Surface it via stderr buffer for diagnostics.
-                    with self._stderr_lock:
-                        self._stderr_lines.append(
-                            f"<non-json on stdout> {line[:200]!r}"
-                        )
-                    continue
+                    msg = json.loads(line, parse_constant=_reject_nonfinite_json)
+                except (json.JSONDecodeError, ValueError):
+                    recorder = getattr(self._connection, "record_diagnostic", None)
+                    if recorder is not None:
+                        recorder(f"<non-json on transport> {line[:200]!r}")
+                    failure = CodexAppServerTransportError(
+                        "codex app-server sent an invalid JSON frame"
+                    )
+                    break
+                if not isinstance(msg, dict):
+                    failure = CodexAppServerTransportError(
+                        "codex app-server sent a non-object JSON-RPC frame"
+                    )
+                    break
                 self._dispatch(msg)
         except Exception as exc:
-            with self._stderr_lock:
-                self._stderr_lines.append(f"<stdout reader error> {exc}")
+            recorder = getattr(self._connection, "record_diagnostic", None)
+            if recorder is not None:
+                recorder(f"<transport reader error> {exc}")
+            failure = CodexAppServerTransportError(
+                "codex app-server transport failed before a response"
+            )
+        finally:
+            if failure is not None:
+                self._terminate_transport(
+                    failure, timeout=3.0, suppress_close_error=True
+                )
+
+    def _terminate_transport(
+        self,
+        failure: BaseException,
+        *,
+        timeout: float,
+        suppress_close_error: bool,
+    ) -> None:
+        """Atomically make transport loss terminal for all future requests."""
+
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._fail_pending(failure)
+            try:
+                self._connection.close(timeout=timeout)
+            except Exception as exc:
+                if not suppress_close_error:
+                    raise
+                recorder = getattr(self._connection, "record_diagnostic", None)
+                if recorder is not None:
+                    recorder(f"<transport close error> {exc}")
+
+    def _fail_pending(self, failure: BaseException) -> None:
+        with self._pending_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for item in pending:
+            try:
+                item.queue.put_nowait(failure)
+            except queue.Full:  # pragma: no cover - defensive
+                pass
 
     def _dispatch(self, msg: dict) -> None:
         # Reply (has id + result/error, no method)
         if "id" in msg and ("result" in msg or "error" in msg):
+            if "result" in msg and "error" in msg:
+                raise CodexAppServerTransportError(
+                    "codex app-server reply contains both result and error"
+                )
+            if "error" in msg:
+                error = msg["error"]
+                if (
+                    not isinstance(error, dict)
+                    or not isinstance(error.get("code"), int)
+                    or not isinstance(error.get("message"), str)
+                ):
+                    raise CodexAppServerTransportError(
+                        "codex app-server sent a malformed JSON-RPC error"
+                    )
             with self._pending_lock:
-                pending = self._pending.pop(msg["id"], None)
+                try:
+                    pending = self._pending.pop(msg["id"], None)
+                except TypeError as exc:
+                    raise CodexAppServerTransportError(
+                        "codex app-server sent an invalid JSON-RPC id"
+                    ) from exc
             if pending is not None:
                 try:
                     pending.queue.put_nowait(msg)
@@ -349,29 +594,38 @@ class CodexAppServerClient:
             return
         # Server-initiated request (has id + method)
         if "id" in msg and "method" in msg:
-            self._server_requests.put(msg)
+            if not isinstance(msg["method"], str) or not msg["method"]:
+                raise CodexAppServerTransportError(
+                    "codex app-server sent an invalid JSON-RPC method"
+                )
+            if self._reject_server_requests:
+                self.respond_error(
+                    msg["id"], -32601, "server-initiated requests are disabled"
+                )
+                return
+            try:
+                self._server_requests.put_nowait(msg)
+            except queue.Full as exc:
+                raise CodexAppServerTransportError(
+                    "codex app-server server-request queue overflowed"
+                ) from exc
             return
         # Notification (no id)
         if "method" in msg:
-            self._notifications.put(msg)
-
-    def _read_stderr(self) -> None:
-        if self._proc.stderr is None:
+            if not isinstance(msg["method"], str) or not msg["method"]:
+                raise CodexAppServerTransportError(
+                    "codex app-server sent an invalid JSON-RPC method"
+                )
+            try:
+                self._notifications.put_nowait(msg)
+            except queue.Full as exc:
+                raise CodexAppServerTransportError(
+                    "codex app-server notification queue overflowed"
+                ) from exc
             return
-        try:
-            for line in iter(self._proc.stderr.readline, b""):
-                if not line:
-                    break
-                with self._stderr_lock:
-                    self._stderr_lines.append(
-                        line.decode("utf-8", "replace").rstrip()
-                    )
-                    # Bound memory: keep last 500 lines.
-                    if len(self._stderr_lines) > 500:
-                        self._stderr_lines = self._stderr_lines[-500:]
-        except Exception:  # pragma: no cover
-            pass
-
+        raise CodexAppServerTransportError(
+            "codex app-server sent an unrecognized JSON-RPC envelope"
+        )
 
 def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:
     """Parse `codex --version` output. Returns (major, minor, patch) or None."""

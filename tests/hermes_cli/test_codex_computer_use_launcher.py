@@ -1,346 +1,250 @@
-"""Behavior tests for the local Codex Computer Use MCP launcher."""
+"""Trust-boundary tests for the replacement Codex App Server broker."""
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
+import socket
+import tempfile
 from types import SimpleNamespace
 
 import pytest
 
-
-LAUNCHER_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "optional-mcps"
-    / "codex-computer-use"
-    / "launcher.py"
-)
+from agent.transports import codex_cua_broker as broker
 
 
-def _load_launcher():
-    spec = importlib.util.spec_from_file_location(
-        "codex_computer_use_launcher", LAUNCHER_PATH
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _executable(tmp_path: Path) -> Path:
+    path = tmp_path / "trusted" / "codex"
+    path.parent.mkdir()
+    path.write_bytes(b"fixture")
+    path.chmod(0o755)
+    return path
 
 
-def _make_installation(tmp_path: Path):
-    codex_home = tmp_path / "portable-codex-home"
-    service = codex_home / "computer-use" / "Codex Computer Use.app"
-    client = service / "Contents" / "SharedSupport" / "SkyComputerUseClient.app"
-    executable = client / "Contents" / "MacOS" / "SkyComputerUseClient"
-    executable.parent.mkdir(parents=True)
-    executable.write_bytes(b"fake executable")
-    executable.chmod(0o755)
-    return codex_home, service, client, executable
+def test_path_snapshot_rejects_symlinked_component(tmp_path) -> None:
+    executable = _executable(tmp_path)
+    linked = tmp_path / "linked"
+    linked.symlink_to(executable.parent, target_is_directory=True)
+
+    real_lstat = broker.os.lstat
+
+    def safe_ancestors(path):
+        info = real_lstat(path)
+        if Path(path) in {linked}:
+            return info
+        # Test temp roots are intentionally world-writable. Mask only their
+        # write bits so this case reaches the symlink under test.
+        values = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        values["st_mode"] = info.st_mode & ~0o022
+        return type("Stat", (), values)()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(broker.os, "lstat", safe_ancestors)
+        with pytest.raises(broker.CodexCUABinaryUntrusted, match="symlink"):
+            broker._trusted_path_snapshot(linked / "codex")
 
 
-def test_resolve_installation_prefers_configured_codex_home(tmp_path):
-    launcher = _load_launcher()
-    codex_home, service, client, executable = _make_installation(tmp_path)
+def test_path_snapshot_rejects_group_writable_application_component(tmp_path) -> None:
+    executable = _executable(tmp_path)
+    executable.parent.chmod(0o775)
 
-    resolved = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path / "ignored-home"
-    )
-
-    assert resolved.codex_home == codex_home.resolve()
-    assert resolved.service_bundle == service.resolve()
-    assert resolved.client_bundle == client.resolve()
-    assert resolved.executable == executable.resolve()
+    with pytest.raises(broker.CodexCUABinaryUntrusted, match="writable"):
+        broker._trusted_path_snapshot(executable)
 
 
-def test_resolve_installation_defaults_to_user_codex_home(tmp_path):
-    launcher = _load_launcher()
-    canonical_home = tmp_path / ".codex"
-    canonical_executable = (
-        canonical_home
-        / "computer-use"
-        / "Codex Computer Use.app"
-        / "Contents"
-        / "SharedSupport"
-        / "SkyComputerUseClient.app"
-        / "Contents"
-        / "MacOS"
-        / "SkyComputerUseClient"
-    )
-    canonical_executable.parent.mkdir(parents=True, exist_ok=True)
-    canonical_executable.write_bytes(b"fake executable")
-    canonical_executable.chmod(0o755)
-
-    resolved = launcher.resolve_installation(env={}, home=tmp_path)
-
-    assert resolved.codex_home == canonical_home.resolve()
-    assert resolved.executable == canonical_executable.resolve()
-
-
-def test_verify_installation_checks_both_signed_bundle_identities(tmp_path):
-    launcher = _load_launcher()
-    codex_home, service, client, _executable = _make_installation(tmp_path)
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path
-    )
-    calls = []
-
-    def fake_run(argv, **kwargs):
-        calls.append((list(argv), dict(kwargs)))
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    launcher.verify_installation(installation, run=fake_run, platform="darwin")
-
-    assert len(calls) == 2
-    assert calls[0][0][-1] == str(service.resolve())
-    assert calls[1][0][-1] == str(client.resolve())
-    assert "com.openai.sky.CUAService" in calls[0][0][-2]
-    assert "com.openai.sky.CUAService.cli" in calls[1][0][-2]
-    for argv, kwargs in calls:
-        requirement = argv[-2]
-        assert argv[:5] == [
-            "/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2"
-        ]
-        assert argv[5] == "-R"
-        assert "=identifier" in requirement
-        assert "anchor apple generic" in requirement
-        assert "certificate 1[field.1.2.840.113635.100.6.2.6] exists" in requirement
-        assert "certificate leaf[field.1.2.840.113635.100.6.1.13] exists" in requirement
-        assert "2DC432GLL2" in requirement
-        assert kwargs["shell"] is False
-
-
-def test_verify_installation_fails_closed_on_signature_mismatch(tmp_path):
-    launcher = _load_launcher()
-    codex_home, _service, _client, _executable = _make_installation(tmp_path)
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path
-    )
-    attempt = 0
-
-    def fake_run(_argv, **_kwargs):
-        nonlocal attempt
-        attempt += 1
-        return SimpleNamespace(
-            returncode=0 if attempt == 1 else 1,
-            stdout="",
-            stderr="sensitive codesign diagnostic that must not escape",
-        )
-
-    with pytest.raises(launcher.LauncherError) as exc_info:
-        launcher.verify_installation(installation, run=fake_run, platform="darwin")
-
-    message = str(exc_info.value)
-    assert "client signature verification failed" in message.lower()
-    assert "sensitive codesign diagnostic" not in message
-    assert str(codex_home) not in message
-
-
-def test_verify_installation_fails_closed_when_expected_executable_disappears(
-    tmp_path,
-):
-    launcher = _load_launcher()
-    codex_home, _service, _client, executable = _make_installation(tmp_path)
-    executable.unlink()
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path
-    )
-
-    with pytest.raises(launcher.LauncherError) as exc_info:
-        launcher.verify_installation(
-            installation,
-            run=lambda *_a, **_kw: pytest.fail("codesign must not run"),
-            platform="darwin",
-        )
-
-    assert "expected client executable is unavailable" in str(exc_info.value).lower()
-    assert str(codex_home) not in str(exc_info.value)
-
-
-def test_verify_installation_rejects_non_macos_hosts(tmp_path):
-    launcher = _load_launcher()
-    codex_home, _service, _client, _executable = _make_installation(tmp_path)
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path
-    )
-
-    with pytest.raises(launcher.LauncherError, match="requires macOS"):
-        launcher.verify_installation(
-            installation,
-            run=lambda *_a, **_kw: pytest.fail("codesign must not run"),
-            platform="linux",
-        )
-
-
-def test_build_exec_argv_uses_verified_client_and_mcp_mode(tmp_path):
-    launcher = _load_launcher()
-    codex_home, _service, _client, executable = _make_installation(tmp_path)
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path
-    )
-
-    assert launcher.build_exec_argv(installation) == (
-        str(executable.resolve()),
-        "mcp",
-    )
-
-
-def test_main_sanitizes_path_resolution_errors(monkeypatch, capsys):
-    launcher = _load_launcher()
-    secret_path = "/private/sensitive/codex-home"
-    monkeypatch.setattr(
-        launcher,
-        "resolve_installation",
-        lambda: (_ for _ in ()).throw(OSError(secret_path)),
-    )
-
-    result = launcher.main()
-
-    captured = capsys.readouterr()
-    assert result == 78
-    assert "installation could not be resolved" in captured.err.lower()
-    assert secret_path not in captured.err
-
-
-def test_main_sanitizes_exec_failure_after_verification(monkeypatch, capsys, tmp_path):
-    launcher = _load_launcher()
-    codex_home, service, client, executable = _make_installation(tmp_path)
-    installation = launcher.Installation(codex_home, service, client, executable)
-    monkeypatch.setattr(launcher, "resolve_installation", lambda: installation)
-    monkeypatch.setattr(launcher, "verify_installation", lambda _installation: None)
-    secret_error = f"failed to execute {executable}"
-
-    result = launcher.main(
-        execve=lambda *_args: (_ for _ in ()).throw(OSError(secret_error))
-    )
-
-    captured = capsys.readouterr()
-    assert result == 78
-    assert "verified client could not be started" in captured.err.lower()
-    assert secret_error not in captured.err
-
-
-def test_symlinked_installation_is_rejected_before_codesign(tmp_path):
-    launcher = _load_launcher()
-    real_home, _service, _client, _executable = _make_installation(tmp_path / "real")
-    linked_home = tmp_path / "linked-codex-home"
-    linked_home.symlink_to(real_home, target_is_directory=True)
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(linked_home)}, home=tmp_path
-    )
-
-    with pytest.raises(launcher.LauncherError, match="symbolic link"):
-        launcher.verify_installation(
-            installation,
-            run=lambda *_a, **_kw: pytest.fail("codesign must not run"),
-            platform="darwin",
-        )
-
-
-@pytest.mark.parametrize(
-    "relative_component",
-    [
-        "computer-use",
-        "computer-use/Codex Computer Use.app/Contents",
-        "computer-use/Codex Computer Use.app/Contents/SharedSupport",
-        (
-            "computer-use/Codex Computer Use.app/Contents/SharedSupport/"
-            "SkyComputerUseClient.app/Contents"
-        ),
-        (
-            "computer-use/Codex Computer Use.app/Contents/SharedSupport/"
-            "SkyComputerUseClient.app/Contents/MacOS"
-        ),
-    ],
-)
-def test_nested_symlink_component_is_rejected_before_codesign(
-    tmp_path, relative_component
-):
-    launcher = _load_launcher()
-    codex_home, _service, _client, _executable = _make_installation(tmp_path)
-    component = codex_home / relative_component
-    target = component.with_name(component.name + "-real")
-    component.rename(target)
-    component.symlink_to(target, target_is_directory=True)
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path
-    )
-
-    with pytest.raises(launcher.LauncherError, match="symbolic link"):
-        launcher.verify_installation(
-            installation,
-            run=lambda *_a, **_kw: pytest.fail("codesign must not run"),
-            platform="darwin",
-        )
-
-
-def test_identity_snapshot_detects_executable_replacement(tmp_path):
-    launcher = _load_launcher()
-    codex_home, _service, _client, executable = _make_installation(tmp_path)
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path
-    )
-    snapshot = launcher.snapshot_installation(installation)
+def test_verified_snapshot_detects_executable_replacement(tmp_path) -> None:
+    executable = _executable(tmp_path)
+    info = executable.lstat()
+    snapshot = (broker._PathSnapshot(
+        str(executable), info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+        info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns,
+        info.st_ctime_ns,
+    ),)
+    verified = broker.VerifiedCodex(str(executable), "0.149.0", snapshot)
     executable.unlink()
     executable.write_bytes(b"replacement")
     executable.chmod(0o755)
 
-    with pytest.raises(launcher.LauncherError, match="changed after verification"):
-        launcher.recheck_installation(installation, snapshot)
+    with pytest.raises(broker.CodexCUABinaryUntrusted, match="changed"):
+        verified.recheck()
 
 
-def test_identity_snapshot_detects_nested_bundle_tamper(tmp_path):
-    launcher = _load_launcher()
-    codex_home, _service, client, _executable = _make_installation(tmp_path)
-    installation = launcher.resolve_installation(
-        env={"CODEX_HOME": str(codex_home)}, home=tmp_path
-    )
-    snapshot = launcher.snapshot_installation(installation)
-    (client / "tamper").write_text("x", encoding="utf-8")
+def test_verified_snapshot_detects_same_size_write_with_restored_mtime(tmp_path) -> None:
+    executable = _executable(tmp_path)
+    info = executable.lstat()
+    snapshot = (broker._PathSnapshot(
+        str(executable), info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+        info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns,
+        info.st_ctime_ns,
+    ),)
+    verified = broker.VerifiedCodex(str(executable), "0.149.0", snapshot)
+    executable.write_bytes(b"changed")  # same size as the original fixture
+    broker.os.utime(executable, ns=(info.st_atime_ns, info.st_mtime_ns))
 
-    with pytest.raises(launcher.LauncherError, match="changed after verification"):
-        launcher.recheck_installation(installation, snapshot)
+    with pytest.raises(broker.CodexCUABinaryUntrusted, match="changed"):
+        verified.recheck()
 
 
-def test_main_passes_only_minimal_environment_to_verified_child(
-    monkeypatch, tmp_path
-):
-    launcher = _load_launcher()
-    codex_home, service, client, executable = _make_installation(tmp_path)
-    installation = launcher.Installation(codex_home, service, client, executable)
-    captured = {}
+def test_daemon_environment_drops_unrelated_credentials(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(broker, "_account_home", lambda: tmp_path)
     monkeypatch.setenv("SECRET_CANARY", "must-not-propagate")
-    monkeypatch.setenv("PATH", "/usr/bin")
-    monkeypatch.setattr(launcher, "resolve_installation", lambda: installation)
-    monkeypatch.setattr(launcher, "verify_installation", lambda _installation: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-propagate")
 
-    def fake_execve(_executable, _argv, env):
-        captured.update(env)
-        raise OSError("stop")
+    env = broker._minimal_daemon_env(tmp_path / ".codex")
 
-    launcher.main(execve=fake_execve)
-
-    assert captured["CODEX_HOME"] == str(codex_home)
-    assert captured["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
-    assert "SECRET_CANARY" not in captured
+    assert env["HOME"] == str(tmp_path)
+    assert env["CODEX_HOME"] == str(tmp_path / ".codex")
+    assert env["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
+    assert "SECRET_CANARY" not in env
+    assert "OPENAI_API_KEY" not in env
 
 
-def test_main_final_recheck_blocks_mutation_between_codesign_and_exec(
-    monkeypatch, tmp_path
-):
-    launcher = _load_launcher()
-    codex_home, service, client, executable = _make_installation(tmp_path)
-    installation = launcher.Installation(codex_home, service, client, executable)
-    monkeypatch.setattr(launcher, "resolve_installation", lambda: installation)
+def test_codesign_verification_enforces_exact_apple_designated_requirement(
+    monkeypatch,
+) -> None:
+    calls = []
 
-    def mutate_after_verification(_installation):
-        executable.unlink()
-        executable.write_bytes(b"post-codesign replacement")
-        executable.chmod(0o755)
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "-dv" in argv:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="",
+                stderr=(
+                    "Identifier=com.openai.codex\n"
+                    "TeamIdentifier=2DC432GLL2\n"
+                ),
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(launcher, "verify_installation", mutate_after_verification)
-    called = []
+    monkeypatch.setattr(broker.subprocess, "run", fake_run)
+    assert broker._codesign_identity(
+        broker.CHATGPT_APP_PATH, broker.CHATGPT_BUNDLE_IDENTIFIER
+    ) == (
+        "com.openai.codex",
+        "2DC432GLL2",
+    )
 
-    result = launcher.main(execve=lambda *_args: called.append(True))
+    requirement = calls[0][calls[0].index("-R") + 1]
+    assert requirement == (
+        '=identifier "com.openai.codex" and anchor apple generic and '
+        "certificate 1[field.1.2.840.113635.100.6.2.6] exists and "
+        "certificate leaf[field.1.2.840.113635.100.6.1.13] exists and "
+        'certificate leaf[subject.OU] = "2DC432GLL2"'
+    )
 
-    assert result == 78
-    assert called == []
+
+def test_private_control_directory_rejects_loose_mode(tmp_path) -> None:
+    control = tmp_path / "app-server-control"
+    control.mkdir(mode=0o755)
+
+    with pytest.raises(broker.CodexCUADaemonUnavailable, match="not private"):
+        broker._validate_private_directory(control, create=False)
+
+
+def test_private_socket_rejects_regular_file(tmp_path) -> None:
+    endpoint = tmp_path / "app-server-control.sock"
+    endpoint.write_bytes(b"not a socket")
+    endpoint.chmod(0o600)
+
+    with pytest.raises(broker.CodexCUADaemonUnavailable, match="socket"):
+        broker._validate_private_socket(endpoint)
+
+
+def test_private_socket_rejects_wrong_owner(monkeypatch, tmp_path) -> None:
+    endpoint = tmp_path / "app-server-control.sock"
+    endpoint.write_bytes(b"fixture")
+    real_lstat = broker.os.lstat
+
+    def wrong_owner(path):
+        info = real_lstat(path)
+        values = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        values["st_mode"] = broker.stat.S_IFSOCK | 0o600
+        values["st_uid"] = broker.os.getuid() + 1
+        return type("Stat", (), values)()
+
+    monkeypatch.setattr(broker.os, "lstat", wrong_owner)
+    with pytest.raises(broker.CodexCUADaemonUnavailable, match="account-owned"):
+        broker._validate_private_socket(endpoint)
+
+
+def test_only_fixed_chatgpt_embedded_codex_path_can_be_resolved(tmp_path) -> None:
+    with pytest.raises(broker.CodexCUABinaryUntrusted, match="only the"):
+        broker.resolve_verified_codex(tmp_path / "codex")
+
+
+@pytest.mark.parametrize(
+    "version_payload,error_type",
+    [
+        (
+            '{"managedCodexVersion":"0.149.0-alpha.4.3",'
+            '"appServerVersion":"0.150.0"}',
+            broker.CodexCUAVersionMismatch,
+        ),
+        ("[]", broker.CodexCUADaemonUnavailable),
+    ],
+)
+def test_daemon_controller_fails_closed_on_version_response_drift(
+    monkeypatch, tmp_path, version_payload, error_type
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    (codex_home / "app-server-control").mkdir(parents=True, mode=0o700)
+
+    def fake_run(argv, **kwargs):
+        if argv[-1] == "version":
+            return SimpleNamespace(
+                returncode=0, stdout=version_payload, stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(broker.subprocess, "run", fake_run)
+    verified = broker.VerifiedCodex(
+        "/signed/codex", "0.149.0-alpha.4.3", ()
+    )
+    with pytest.raises(error_type):
+        broker.CodexAppServerDaemonController(codex_home).ensure_ready(verified)
+
+
+def test_daemon_controller_uses_idempotent_managed_commands_and_private_socket(
+    monkeypatch,
+) -> None:
+    # macOS limits AF_UNIX names to 104 bytes; pytest's nested tmp_path can
+    # exceed that even though the production CODEX_HOME path does not.
+    with tempfile.TemporaryDirectory(prefix="hcua-", dir="/tmp") as root:
+        codex_home = Path(root) / "codex-home"
+        control = codex_home / "app-server-control"
+        control.mkdir(parents=True, mode=0o700)
+        socket_path = control / broker.APP_SERVER_SOCKET_NAME
+        endpoint = socket.socket(socket.AF_UNIX)
+        endpoint.bind(str(socket_path))
+        socket_path.chmod(0o600)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((list(argv), dict(kwargs)))
+            if argv[-1] == "version":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{"managedCodexVersion":"0.149.0-alpha.4.3",'
+                    '"appServerVersion":"0.149.0-alpha.4.3"}',
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(broker.subprocess, "run", fake_run)
+        verified = broker.VerifiedCodex(
+            "/signed/codex", "0.149.0-alpha.4.3", ()
+        )
+        try:
+            ready = broker.CodexAppServerDaemonController(codex_home).ensure_ready(
+                verified
+            )
+        finally:
+            endpoint.close()
+
+        assert ready.socket_path == str(socket_path)
+        assert [call[0][-2:] for call in calls] == [
+            ["daemon", "start"],
+            ["daemon", "version"],
+        ]
+        assert calls[0][1]["env"]["CODEX_HOME"] == str(codex_home)
+        assert calls[0][1]["env"]["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"

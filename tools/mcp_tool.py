@@ -121,6 +121,7 @@ from urllib.parse import urlparse
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
 from tools.mcp_pinned_surfaces import (
+    CODEX_CUA_APP_SERVER_CATALOG_SHA256 as _CODEX_CUA_APP_SERVER_CATALOG_SHA256,
     CODEX_CUA_CAPABILITIES_SHA256 as _CODEX_CUA_CAPABILITIES_SHA256,
     CODEX_CUA_TOOLS_SHA256 as _CODEX_CUA_TOOLS_SHA256,
     CODEX_CUA_TOOL_NAMES as _CODEX_CUA_TOOL_NAMES,
@@ -4784,25 +4785,23 @@ def _ordinary_mcp_capability_identity(server_name: str) -> str:
     return f"mcp-server:{server_name}"
 
 
-def _codex_cua_launcher_path() -> str:
-    return os.path.realpath(os.path.join(
-        os.path.dirname(__file__), "..", "optional-mcps",
-        "codex-computer-use", "launcher.py",
-    ))
+def _is_canonical_codex_cua_adapter(config: Optional[dict]) -> bool:
+    """Recognize only the commandless host-owned App Server adapter."""
 
-
-def _is_canonical_codex_cua_launcher(config: Optional[dict]) -> bool:
-    command = (config or {}).get("command")
+    config = config or {}
     return (
-        isinstance(command, str)
-        and os.path.realpath(command) == _codex_cua_launcher_path()
+        config.get("transport") == "codex_app_server"
+        and "command" not in config
+        and "url" not in config
+        and "args" not in config
+        and "env" not in config
     )
 
 
 def _remember_mcp_capability_identity(server_name: str, config: dict) -> str:
     identity = (
         _CODEX_CUA_CAPABILITY_IDENTITY
-        if _is_canonical_codex_cua_launcher(config)
+        if _is_canonical_codex_cua_adapter(config)
         else _ordinary_mcp_capability_identity(server_name)
     )
     with _lock:
@@ -5683,7 +5682,7 @@ _single_writer_capability_keys: Dict[str, str] = {}
 
 def _single_writer_capability_key(server_name: str, config: Optional[dict] = None) -> str:
     if config is not None:
-        if _is_canonical_codex_cua_launcher(config):
+        if _is_canonical_codex_cua_adapter(config):
             return _CODEX_CUA_CAPABILITY_IDENTITY
         return _ordinary_mcp_capability_identity(server_name)
     if _mcp_capability_identity(server_name) == _CODEX_CUA_CAPABILITY_IDENTITY:
@@ -6814,6 +6813,132 @@ def _ensure_healthy_or_recycle(server: Any, server_name: str) -> None:
         _signal_reconnect(server)
 
 
+_codex_cua_broker_instance = None
+
+
+def _get_codex_cua_broker():
+    """Return the process-local broker facade; it owns no persistent socket."""
+
+    global _codex_cua_broker_instance
+    with _lock:
+        if _codex_cua_broker_instance is None:
+            from agent.transports.codex_cua_broker import CodexCUABroker
+
+            _codex_cua_broker_instance = CodexCUABroker()
+        return _codex_cua_broker_instance
+
+
+def _mcp_protocol_object(value: Any) -> Any:
+    """Project App Server JSON into the attribute shape used by MCP SDK models."""
+
+    if isinstance(value, dict):
+        projected = {}
+        for key, item in value.items():
+            field = "meta" if key == "_meta" else key
+            if key in {"_meta", "meta", "structuredContent", "structured_content"}:
+                # These fields are arbitrary JSON payloads in the MCP model,
+                # not nested protocol objects. In particular, literal `_meta`
+                # keys inside structured content must remain byte-semantic
+                # data rather than being projected to an SDK attribute name.
+                projected[field] = item
+            else:
+                projected[field] = _mcp_protocol_object(item)
+        return SimpleNamespace(**projected)
+    if isinstance(value, list):
+        return [_mcp_protocol_object(item) for item in value]
+    return value
+
+
+def _render_mcp_tool_result(
+    result: Any, server_name: str, tool_name: str,
+) -> Tuple[str, Optional[str]]:
+    """Sanitize and render one result identically across MCP transports."""
+
+    if mcp_field(result, "is_error", "isError", False):
+        error_text = ""
+        for block in (getattr(result, "content", None) or []):
+            if getattr(block, "text", None):
+                error_text += block.text
+                continue
+            res_text = getattr(getattr(block, "resource", None), "text", None)
+            if res_text:
+                error_text += str(res_text)
+        return tool_error(_sanitize_error(_truncate_mcp_text_result(
+            error_text or "MCP tool returned an error"
+        ))), None
+
+    trusted_digest = None
+    if _is_codex_cua_identity(server_name) and tool_name == "get_app_state":
+        try:
+            trusted_digest = _trusted_mcp_result_sha256(result)
+        except (TypeError, ValueError):
+            trusted_digest = None
+
+    parts: List[str] = []
+    for block in (getattr(result, "content", None) or []):
+        if getattr(block, "text", None):
+            parts.append(strip_unicode_tags(block.text))
+            continue
+        image_tag = _cache_mcp_image_block(block)
+        if image_tag:
+            parts.append(image_tag)
+            continue
+        audio_tag = _cache_mcp_audio_block(block)
+        if audio_tag:
+            parts.append(audio_tag)
+            continue
+        resource_text = _render_mcp_resource_block(block, server_name)
+        if resource_text:
+            parts.append(resource_text)
+            continue
+        block_type = getattr(block, "type", None) or type(block).__name__
+        if block_type in {"text", "resource", "audio", "image"}:
+            logger.debug(
+                "MCP %s: content block type %r rendered empty",
+                server_name, block_type,
+            )
+        else:
+            logger.warning(
+                "MCP %s: dropping unsupported content block type %r",
+                server_name, block_type,
+            )
+    text_result = _truncate_mcp_text_result("\n".join(parts) if parts else "")
+    structured = mcp_field(result, "structured_content", "structuredContent")
+    if structured is not None:
+        structured = _capability_json_value(structured)
+        try:
+            structured_json = json.dumps(
+                structured, ensure_ascii=False, default=str
+            )
+        except (TypeError, ValueError):
+            structured_json = None
+        if (
+            structured_json is not None
+            and len(structured_json) > _MCP_HARD_RESULT_CAP_CHARS
+        ):
+            structured = _truncate_mcp_text_result(structured_json)
+    meta = _strip_reserved_meta_keys(
+        _capability_json_value(mcp_field(result, "meta", "_meta"))
+    )
+    if structured is not None or meta is not None:
+        payload: Dict[str, Any] = {}
+        if text_result:
+            payload["result"] = text_result
+        if structured is not None:
+            if text_result:
+                payload["structuredContent"] = structured
+            else:
+                payload["result"] = structured
+        if meta is not None:
+            payload["_meta"] = meta
+        payload.setdefault("result", text_result)
+        try:
+            return json.dumps(payload, ensure_ascii=False), trusted_digest
+        except (TypeError, ValueError):
+            pass
+    return json.dumps({"result": text_result}, ensure_ascii=False), trusted_digest
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -6865,6 +6990,47 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     f"approaches or ask the user to check the MCP server."
                 )
             # Cooldown elapsed → fall through as a half-open probe.
+
+        with _lock:
+            pinned_config = _pinned_lazy_server_configs.get(server_name)
+        if pinned_config is not None and _is_canonical_codex_cua_adapter(
+            pinned_config
+        ):
+            try:
+                raw_result = _get_codex_cua_broker().call(
+                    tool_name, args, timeout=tool_timeout
+                )
+                rendered, trusted_digest = _render_mcp_tool_result(
+                    _mcp_protocol_object(raw_result), server_name, tool_name
+                )
+                try:
+                    parsed = json.loads(rendered)
+                    if "error" in parsed:
+                        _bump_server_error(server_name)
+                    else:
+                        _reset_server_error(server_name)
+                        rendered = _record_state_result_for_exact_grant(
+                            server_name=server_name,
+                            tool_name=tool_name,
+                            args=args,
+                            task_id=owner_task_id,
+                            result=rendered,
+                            trusted_state_digest=trusted_digest,
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    _reset_server_error(server_name)
+                return rendered
+            except InterruptedError:
+                return _interrupted_call_result()
+            except Exception as exc:
+                _bump_server_error(server_name)
+                logger.error(
+                    "Codex App Server CUA %s/%s call failed: %s",
+                    server_name, tool_name, exc,
+                )
+                return tool_error(_sanitize_error(
+                    f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                ))
 
         server = _get_connected_server_for_call(server_name)
         if not server:
@@ -6985,140 +7151,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _mark_proven = getattr(server, "_mark_session_proven", None)
             if _mark_proven is not None:
                 _mark_proven()
-            # MCP CallToolResult has .content (list of content blocks) and
-            # .is_error (.isError before mcp 2.0)
-            if mcp_field(result, "is_error", "isError", False):
-                error_text = ""
-                for block in (result.content or []):
-                    if getattr(block, "text", None):
-                        error_text += block.text
-                        continue
-                    # EmbeddedResource blocks inside error payloads carry
-                    # their text under .resource.text — previously dropped,
-                    # leaving a bare "MCP tool returned an error".
-                    res_text = getattr(getattr(block, "resource", None), "text", None)
-                    if res_text:
-                        error_text += str(res_text)
-                return tool_error(_sanitize_error(
-                    _truncate_mcp_text_result(
-                        error_text or "MCP tool returned an error"
-                    )
-                ))
-
-            # Bind exact-action authorization to the trusted, structured MCP
-            # result before images are rendered as model-visible MEDIA: cache
-            # paths. Never recover a path from tool-controlled result text.
-            if _is_codex_cua_identity(server_name) and tool_name == "get_app_state":
-                try:
-                    trusted_state_digest["value"] = _trusted_mcp_result_sha256(result)
-                except (TypeError, ValueError):
-                    # Unserializable result shapes remain safe: the outer
-                    # recorder hashes literal rendered text without file I/O.
-                    trusted_state_digest.clear()
-
-            # Collect text from content blocks. MCP tool results can also
-            # include ImageContent blocks (screenshot / Blockbench / Playwright
-            # etc.); cache those via the gateway's image-cache helper so they
-            # flow through Hermes' MEDIA: tag convention and out to messaging
-            # adapters that render images natively. Without this, image blocks
-            # were silently dropped and the agent got an empty response.
-            #
-            # Distilled from #17915 (c3115644151) and #10848 (gnanirahulnutakki),
-            # both too stale to cherry-pick. #10848's approach (integrate with
-            # Hermes' MEDIA tag + cache_image_from_bytes) was the cleaner of
-            # the two — plugs into existing infrastructure.
-            parts: List[str] = []
-            for block in (result.content or []):
-                if hasattr(block, "text") and block.text:
-                    parts.append(strip_unicode_tags(block.text))
-                    continue
-                image_tag = _cache_mcp_image_block(block)
-                if image_tag:
-                    parts.append(image_tag)
-                    continue
-                audio_tag = _cache_mcp_audio_block(block)
-                if audio_tag:
-                    parts.append(audio_tag)
-                    continue
-                # ResourceLink / EmbeddedResource blocks (PDFs, archives,
-                # office docs, ...). Previously these were silently dropped,
-                # so document-oriented MCP tools appeared to return metadata
-                # only (enterprise customer report, 2026-07).
-                resource_text = _render_mcp_resource_block(block, server_name)
-                if resource_text:
-                    parts.append(resource_text)
-                    continue
-                # Benign empty renders (empty text blocks, empty text
-                # resources, audio in a process without the gateway cache)
-                # aren't data loss — log at debug. Warn only for genuinely
-                # unrecognized block shapes.
-                block_type = getattr(block, "type", None) or type(block).__name__
-                if block_type in {"text", "resource", "audio", "image"}:
-                    logger.debug(
-                        "MCP %s: content block type %r rendered empty",
-                        server_name, block_type,
-                    )
-                else:
-                    logger.warning(
-                        "MCP %s: dropping unsupported content block type %r",
-                        server_name, block_type,
-                    )
-            text_result = "\n".join(parts) if parts else ""
-
-            # Hard-cap pathological payloads before they propagate (#56059);
-            # ordinary large results pass untouched to the spillover layer.
-            text_result = _truncate_mcp_text_result(text_result)
-
-            # Combine content + structuredContent when both are present.
-            # MCP spec: content is model-oriented (text), structuredContent
-            # is machine-oriented (JSON metadata).  For an AI agent, content
-            # is the primary payload; structuredContent supplements it.
-            #
-            # Server-level `_meta` is also surfaced (ported from
-            # MoonshotAI/kimi-code#2596): servers return namespaced metadata
-            # there (validated contracts, browser-handoff payloads, ...) that
-            # was previously invisible to the agent. Protocol-reserved keys
-            # are dropped first (kimi-code#2600) — per the MCP spec's key-name
-            # rules a prefix is reserved when a `modelcontextprotocol` or
-            # `mcp` label is followed by at least one more label (e.g.
-            # `modelcontextprotocol.io/...`, `tools.mcp.com/...`); those carry
-            # host/protocol plumbing, not model-facing data. Unprefixed and
-            # vendor-namespaced keys (`com.example.mcp/...`) pass through —
-            # their semantics belong to the server.
-            structured = mcp_field(result, "structured_content", "structuredContent")
-            # Cap structuredContent too — a malicious server could flood
-            # context via a multi-MB JSON payload (#56059). When the
-            # serialized form exceeds the hard cap, replace it with the
-            # truncated string (head + tail preserved) so it degrades
-            # gracefully instead of flooding downstream.
-            if structured is not None:
-                try:
-                    _structured_json = json.dumps(structured, ensure_ascii=False, default=str)
-                except (TypeError, ValueError):
-                    _structured_json = None
-                if _structured_json is not None and len(_structured_json) > _MCP_HARD_RESULT_CAP_CHARS:
-                    structured = _truncate_mcp_text_result(_structured_json)
-            meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
-            if structured is not None or meta is not None:
-                payload: Dict[str, Any] = {}
-                if text_result:
-                    payload["result"] = text_result
-                if structured is not None:
-                    if text_result:
-                        payload["structuredContent"] = structured
-                    else:
-                        payload["result"] = structured
-                if meta is not None:
-                    payload["_meta"] = meta
-                if "result" not in payload:
-                    payload["result"] = text_result
-                try:
-                    return json.dumps(payload, ensure_ascii=False)
-                except (TypeError, ValueError):
-                    # Non-serializable metadata: drop the extras rather than
-                    # failing the whole tool call.
-                    return json.dumps({"result": text_result}, ensure_ascii=False)
-            return json.dumps({"result": text_result}, ensure_ascii=False)
+            rendered, trusted_digest = _render_mcp_tool_result(
+                result, server_name, tool_name
+            )
+            if trusted_digest is None:
+                trusted_state_digest.clear()
+            else:
+                trusted_state_digest["value"] = trusted_digest
+            return rendered
 
         def _call_once():
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
@@ -8295,12 +8335,13 @@ class _CachedMCPTool:
 
 
 def _get_host_pinned_surface(config: dict):
-    """Classify the canonical launcher and require its literal host policy."""
+    """Classify the commandless host adapter and require literal policy."""
 
     from tools.mcp_pinned_surfaces import get_surface
 
     compatibility = config.get("compatibility")
     exact_compatibility = {
+        "app_server_catalog_sha256": _CODEX_CUA_APP_SERVER_CATALOG_SHA256,
         "tools_sha256": _CODEX_CUA_TOOLS_SHA256,
         "capabilities_sha256": _CODEX_CUA_CAPABILITIES_SHA256,
         "tool_count": 10,
@@ -8312,11 +8353,11 @@ def _get_host_pinned_surface(config: dict):
         and compatibility.get("capabilities_sha256")
         == _CODEX_CUA_CAPABILITIES_SHA256
     )
-    if not _is_canonical_codex_cua_launcher(config):
+    if not _is_canonical_codex_cua_adapter(config):
         if claims_cua_digest_pair:
             raise ValueError(
                 "the Codex CUA digest pair is reserved for the canonical "
-                "signed-launcher adapter"
+                "host adapter"
             )
         return None
 
@@ -8332,12 +8373,13 @@ def _get_host_pinned_surface(config: dict):
         or config.get("supports_parallel_tool_calls") is not False
         or config.get("trust") != _TRUST_UNTRUSTED
         or config.get("minimal_env") is not True
-        or config.get("args") is not None
-        or config.get("env") not in (None, {})
+        or "command" in config
+        or "args" in config
+        or "env" in config
         or "url" in config
     ):
         raise ValueError(
-            "canonical Codex CUA launcher requires the literal pinned digest, "
+            "canonical Codex CUA host adapter requires the literal pinned digest, "
             "ten-tool allowlist, tools-only, untrusted, minimal-environment, "
             "non-parallel single-writer policy"
         )
@@ -8796,7 +8838,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
 
-    # Classify the checked-in launcher before any eager/lazy routing.  Its
+    # Classify the checked-in host adapter before any eager/lazy routing. Its
     # identity is authoritative even when the manifest policy is missing or
     # malformed, so policy drift is rejected instead of falling through to
     # the ordinary eager connector.  Conversely, hashes alone never grant the

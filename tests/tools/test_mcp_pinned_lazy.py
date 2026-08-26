@@ -27,15 +27,13 @@ RAW_TOOLS = [
 
 def _config() -> dict:
     return {
-        "command": str(
-            Path(mcp_tool.__file__).resolve().parents[1]
-            / "optional-mcps" / "codex-computer-use" / "launcher.py"
-        ),
+        "transport": "codex_app_server",
         "single_writer": True,
         "trust": "untrusted",
         "minimal_env": True,
         "supports_parallel_tool_calls": False,
         "compatibility": {
+            "app_server_catalog_sha256": "f710c1eacba2487b5547ddafe8aeb616268850ea4501df3a4a047552a1608a40",
             "tools_sha256": TOOLS_SHA256,
             "capabilities_sha256": CAPABILITIES_SHA256,
             "tool_count": 10,
@@ -120,17 +118,17 @@ def test_checked_in_surface_reproduces_live_fingerprints() -> None:
     with pytest.raises(ValueError, match="literal pinned digest"):
         mcp_tool._get_host_pinned_surface(poisoned)
 
-    wrong_launcher = _config()
-    wrong_launcher["command"] = "/tmp/user-controlled-launcher"
-    with pytest.raises(ValueError, match="signed-launcher"):
-        mcp_tool._get_host_pinned_surface(wrong_launcher)
+    wrong_adapter = _config()
+    wrong_adapter["transport"] = "stdio"
+    with pytest.raises(ValueError, match="host adapter"):
+        mcp_tool._get_host_pinned_surface(wrong_adapter)
 
 
 @pytest.mark.parametrize(
     "mutation",
     ["missing_compatibility", "changed_digest", "normalized_trust", "missing_allowlist"],
 )
-def test_canonical_launcher_policy_drift_is_rejected_without_eager_fallback(
+def test_canonical_adapter_policy_drift_is_rejected_without_eager_fallback(
     mutation: str,
 ) -> None:
     config = _config()
@@ -156,16 +154,16 @@ def test_canonical_launcher_policy_drift_is_rejected_without_eager_fallback(
     assert "renamed-cua" not in mcp_tool._pinned_lazy_server_configs
 
 
-def test_noncanonical_launcher_cannot_claim_cua_identity_from_digest_pair() -> None:
+def test_noncanonical_adapter_cannot_claim_cua_identity_from_digest_pair() -> None:
     config = _config()
-    config["command"] = "/usr/bin/false"
+    config["transport"] = "stdio"
 
     assert mcp_tool._single_writer_capability_key("digest-impostor", config) != (
         "openai-codex-cua"
     )
 
 
-def test_canonical_launcher_aliases_share_one_capability_lock(
+def test_canonical_adapter_aliases_share_one_capability_lock(
     tmp_path: Path, monkeypatch,
 ) -> None:
     monkeypatch.setattr(mcp_tool, "_machine_account_home_for_lock", lambda: tmp_path)
@@ -1518,84 +1516,93 @@ def test_sessionless_live_task_is_reused_without_second_discovery() -> None:
     discover.assert_not_called()
 
 
-def test_dispatch_acquires_writer_before_first_upstream_connect() -> None:
+def test_dispatch_acquires_writer_before_first_broker_call() -> None:
     order = []
+    mcp_tool._pinned_lazy_server_configs["codex-computer-use"] = _config()
     handler = mcp_tool._make_tool_handler(
         "codex-computer-use", "list_apps", 5.0
     )
+    broker = SimpleNamespace(call=lambda *_a, **_kw: (
+        order.append("broker") or {
+            "content": [{"type": "text", "text": "[]"}],
+            "isError": False,
+        }
+    ))
     with patch("tools.mcp_tool._trust_gate_check", return_value=None), \
          patch(
              "tools.mcp_tool._acquire_single_writer_lease",
              side_effect=lambda *_a, **_kw: order.append("lease") or True,
          ), \
+         patch("tools.mcp_tool._get_codex_cua_broker", return_value=broker), \
          patch(
              "tools.mcp_tool._get_connected_server_for_call",
-             side_effect=lambda *_a: order.append("connect") or None,
+             side_effect=AssertionError("broker must not create MCPServerTask"),
          ):
         result = handler({}, task_id="turn-a")
 
-    assert order == ["lease", "connect"]
-    assert "not connected" in result
+    assert order == ["lease", "broker"]
+    assert result == '{"result": "[]"}'
 
 
-def test_first_pinned_list_apps_call_serializes_and_disconnects_before_unlock(
+def test_denial_and_open_breaker_do_zero_broker_work() -> None:
+    name = "codex-computer-use"
+    mcp_tool._pinned_lazy_server_configs[name] = _config()
+    denied = mcp_tool._make_tool_handler(name, "click", 5.0)
+    broker = SimpleNamespace(call=lambda *_a, **_kw: pytest.fail("broker called"))
+    with patch("tools.mcp_tool._get_codex_cua_broker", return_value=broker), \
+         patch("tools.mcp_tool._acquire_single_writer_lease") as lease, \
+         patch("tools.mcp_tool._trust_gate_check", return_value='{"error":"denied"}'):
+        assert denied({"app": "Finder"}, task_id="turn-a") == '{"error":"denied"}'
+    lease.assert_not_called()
+
+    mcp_tool._server_error_counts[name] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+    mcp_tool._server_breaker_opened_at[name] = __import__("time").monotonic()
+    read = mcp_tool._make_tool_handler(name, "list_apps", 5.0)
+    with patch("tools.mcp_tool._get_codex_cua_broker", return_value=broker), \
+         patch("tools.mcp_tool._trust_gate_check", return_value=None), \
+         patch("tools.mcp_tool._acquire_single_writer_lease", return_value=True):
+        assert "Auto-retry" in read({}, task_id="turn-a")
+    mcp_tool._server_error_counts.pop(name, None)
+    mcp_tool._server_breaker_opened_at.pop(name, None)
+
+
+def test_first_pinned_broker_call_stays_serialized_until_task_release(
     monkeypatch, tmp_path: Path,
 ) -> None:
-    import asyncio
-
     registry = ToolRegistry()
     alias = "first-call-cua"
     observed = []
 
-    class Session:
-        async def call_tool(self, tool_name, arguments):
+    class Broker:
+        def call(self, tool_name, arguments, *, timeout):
             assert tool_name == "list_apps"
             assert arguments == {}
-            return SimpleNamespace(
-                content=[SimpleNamespace(text="[]")],
-                is_error=False,
-                structured_content=None,
-                meta=None,
-            )
-
-    class Server:
-        def __init__(self):
-            self.session = Session()
-            self._rpc_lock = asyncio.Lock()
-            self._inflight_tasks = set()
-            self._reconnecting = False
-            self._pending_call_context = None
-
-        async def shutdown(self):
             observed.append(
                 mcp_tool._acquire_single_writer_lease(
                     alias, "second-owner", wait_timeout_seconds=0,
                 )
             )
-            self.session = None
+            return {"content": [{"type": "text", "text": "[]"}], "isError": False}
 
     monkeypatch.setattr(
         mcp_tool, "_machine_account_home_for_lock", lambda: tmp_path
     )
-    server = Server()
     with patch("tools.registry.registry", registry), \
          patch("tools.mcp_tool._MCP_AVAILABLE", True), \
-         patch(
-             "tools.mcp_tool._run_on_mcp_loop",
-             side_effect=lambda factory, **_kwargs: asyncio.run(factory()),
-         ):
+         patch("tools.mcp_tool._get_codex_cua_broker", return_value=Broker()), \
+         patch("tools.mcp_tool._get_connected_server_for_call") as upstream:
         names = mcp_tool.register_mcp_servers({alias: _config()})
         list_apps = next(name for name in names if name.endswith("__list_apps"))
-        mcp_tool._servers[alias] = server
 
         result = registry.dispatch(list_apps, {}, task_id="first-owner")
         assert result == '{"result": "[]"}'
+        upstream.assert_not_called()
+        assert observed == [False]
         assert not mcp_tool._acquire_single_writer_lease(
             alias, "second-owner", wait_timeout_seconds=0,
         )
 
         mcp_tool.release_mcp_single_writer_leases("first-owner")
-        assert observed == [False]
         assert alias not in mcp_tool._servers
         assert mcp_tool._acquire_single_writer_lease(
             alias, "second-owner", wait_timeout_seconds=0,

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import importlib.util
-import sys
 
 import pytest
 import yaml
@@ -32,18 +30,19 @@ def _entry():
     return entry
 
 
-def test_catalog_entry_builds_local_verified_serial_mcp_config():
+def test_catalog_entry_builds_commandless_host_broker_config():
     entry = _entry()
 
     config = mcp_catalog._build_server_config(entry, install_dir=None)
 
     assert config == {
-        "command": str((entry.manifest_path.parent / "launcher.py").resolve()),
+        "transport": "codex_app_server",
         "trust": "untrusted",
         "supports_parallel_tool_calls": False,
         "single_writer": True,
         "minimal_env": True,
         "compatibility": {
+            "app_server_catalog_sha256": "f710c1eacba2487b5547ddafe8aeb616268850ea4501df3a4a047552a1608a40",
             "tools_sha256": "dd485a140f5fbebe14147fb3ee2ed3914618b3484964efe02262b2479b322f1d",
             "capabilities_sha256": "52aa21370a62916d63adb5718fa1be519ec0fe4390136bf36e701be54e5582a5",
             "tool_count": 10,
@@ -85,7 +84,7 @@ def test_catalog_entry_pins_exact_cua_tool_surface_without_probe(monkeypatch):
 def test_fixed_policy_disables_resource_and_prompt_utility_tools(monkeypatch):
     state = {
         "mcp_servers": {
-            "codex-computer-use": {"command": "/verified/launcher.py"}
+            "codex-computer-use": {"transport": "codex_app_server"}
         }
     }
     monkeypatch.setattr(mcp_catalog, "load_config", lambda: state)
@@ -111,8 +110,8 @@ def test_catalog_entry_is_local_only_and_does_not_redistribute_openai_assets():
         if path.is_file() and "__pycache__" not in path.parts
     }
 
-    assert shipped_files == {"launcher.py", "manifest.yaml"}
-    assert entry.transport.type == "stdio"
+    assert shipped_files == {"manifest.yaml"}
+    assert entry.transport.type == "codex_app_server"
     assert entry.install is None
     assert entry.auth.type == "none"
 
@@ -163,54 +162,11 @@ def test_catalog_rejects_unknown_trust_tier(tmp_path):
         mcp_catalog._parse_manifest(path)
 
 
-@pytest.mark.macos_only
-def test_live_launcher_initialize_list_matches_pinned_tools_only_surface():
-    if sys.platform != "darwin":
-        pytest.skip("installed local Codex CUA exists only on macOS")
-    entry = _entry()
-    config = mcp_catalog._build_server_config(entry, install_dir=None)
-    launcher = Path(config["command"])
-    if not launcher.exists():
-        pytest.skip("local launcher is unavailable")
-    spec = importlib.util.spec_from_file_location("codex_cua_live_launcher", launcher)
-    assert spec is not None and spec.loader is not None
-    launcher_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(launcher_module)
-    try:
-        installation = launcher_module.resolve_installation()
-    except OSError:
-        pytest.skip("installed Codex CUA dependency is unavailable")
-    if not (
-        installation.service_bundle.is_dir()
-        and installation.client_bundle.is_dir()
-        and installation.executable.is_file()
-    ):
-        pytest.skip("installed Codex CUA dependency is unavailable")
-
-    from tools import mcp_tool
-
-    mcp_tool._ensure_mcp_loop()
-
-    async def inspect():
-        server = await mcp_tool._connect_server(entry.name, config)
-        try:
-            capabilities = server.initialize_result.capabilities
-            mcp_tool._validate_mcp_surface(
-                entry.name, server._tools, capabilities, config
-            )
-            return [tool.name for tool in server._tools], capabilities
-        finally:
-            await server.shutdown()
-
-    try:
-        names, capabilities = mcp_tool._run_on_mcp_loop(inspect(), timeout=30)
-    finally:
-        mcp_tool._stop_mcp_loop_if_idle()
-
-    assert names == EXPECTED_TOOLS
-    assert (
-        mcp_tool._mcp_capabilities_sha256(capabilities)
-        == config["compatibility"]["capabilities_sha256"]
+def test_reserved_transport_is_rejected_outside_the_shipped_entry(tmp_path):
+    path = _write_manifest(
+        tmp_path,
+        transport={"type": "codex_app_server"},
     )
-    assert capabilities.resources is None
-    assert capabilities.prompts is None
+
+    with pytest.raises(mcp_catalog.CatalogError, match="reserved"):
+        mcp_catalog._parse_manifest(path)
