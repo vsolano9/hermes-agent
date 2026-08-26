@@ -4655,6 +4655,7 @@ _lazy_server_tool_names: Dict[str, List[str]] = {}
 # the process lifetime, and every turn gets a fresh validated live session.
 _pinned_lazy_server_configs: Dict[str, dict] = {}
 _pinned_lazy_server_tool_names: Dict[str, List[str]] = {}
+_mcp_shutting_down = False
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -6629,6 +6630,8 @@ def _ensure_pinned_server_connected(server_name: str) -> bool:
     """Create one ephemeral, live-validated session for a host-pinned server."""
 
     with _lock:
+        if _mcp_shutting_down:
+            return False
         server = _servers.get(server_name)
         if server is not None and server.session is not None:
             return True
@@ -6725,6 +6728,8 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     handlers all trigger the deferred spawn (#56832).
     """
     with _lock:
+        if _mcp_shutting_down:
+            return None
         server = _servers.get(server_name)
         is_lazy = server_name in _lazy_server_configs
         is_pinned_lazy = server_name in _pinned_lazy_server_configs
@@ -7420,19 +7425,100 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_check_fn(server_name: str):
-    """Return a check function that verifies the MCP connection is alive."""
+def _make_check_fn(
+    server_name: str,
+    pinned_attestation: Optional[Tuple[Tuple[str, Any, str], ...]] = None,
+):
+    """Return a check for live/lazy availability and pinned-policy integrity."""
 
     def _check() -> bool:
         with _lock:
+            if _mcp_shutting_down:
+                return False
+            pinned_config = _pinned_lazy_server_configs.get(server_name)
             server = _servers.get(server_name)
-            if server is not None and (
-                server.session is not None or server._is_recycled_stdio()
+            if pinned_config is None:
+                if server is not None and (
+                    server.session is not None or server._is_recycled_stdio()
+                ):
+                    return True
+                # Lazy (schema-cache registered) servers are available: the
+                # first real call spawns/connects them (#56832).
+                if server_name in _lazy_server_configs:
+                    return True
+                return False
+
+        # Host-pinned lazy handlers are intentionally model-visible before an
+        # upstream client exists. Treat them as available only while the
+        # complete checked-in publication and its call-time security policy
+        # are still exact. Registry reads happen before MCP/writer locks, which
+        # preserves the mutation order registry -> MCP state -> writer policy.
+        try:
+            surface = _get_host_pinned_surface(pinned_config)
+        except (TypeError, ValueError):
+            return False
+        if surface is None:
+            return False
+        expected_names = [
+            mcp_prefixed_tool_name(server_name, raw_name)
+            for raw_name in _CODEX_CUA_TOOL_NAMES
+        ]
+        if pinned_attestation is None:
+            return False
+        expected_entries = {
+            name: (handler, schema_json)
+            for name, handler, schema_json in pinned_attestation
+        }
+        expected_hints = {
+            tool.name: _annotation_read_only_hint(tool)
+            for tool in surface.tools
+        }
+        toolset_name = f"mcp-{server_name}"
+        from tools.registry import registry
+
+        if (
+            registry.get_tool_names_for_toolset(toolset_name)
+            != sorted(expected_names)
+            or registry.get_toolset_alias_target(server_name) != toolset_name
+        ):
+            return False
+        for tool_name in expected_names:
+            entry = registry.get_entry(tool_name)
+            if (
+                entry is None
+                or entry.toolset != toolset_name
+                or entry.check_fn is not _check
+                or tool_name not in expected_entries
+                or entry.handler is not expected_entries[tool_name][0]
+                or json.dumps(
+                    entry.schema, sort_keys=True, separators=(",", ":")
+                ) != expected_entries[tool_name][1]
             ):
-                return True
-            # Lazy (schema-cache registered) servers are available: the
-            # first real call spawns/connects them (#56832).
-            return server_name in _lazy_server_configs
+                return False
+
+        with _lock:
+            if (
+                _pinned_lazy_server_configs.get(server_name) is not pinned_config
+                or _pinned_lazy_server_tool_names.get(server_name)
+                != expected_names
+                or _server_trust_levels.get(server_name)
+                != _TRUST_UNTRUSTED
+                or _tool_read_only_hints.get(server_name) != expected_hints
+                or _mcp_server_capability_identities.get(server_name)
+                != _CODEX_CUA_CAPABILITY_IDENTITY
+                or server_name in _parallel_safe_servers
+                or any(
+                    _mcp_tool_server_names.get(tool_name) != server_name
+                    for tool_name in expected_names
+                )
+            ):
+                return False
+            with _single_writer_condition:
+                return (
+                    _single_writer_policies.get(server_name) == (90.0, 10.0)
+                    and _single_writer_capability_keys.get(server_name)
+                    == _CODEX_CUA_CAPABILITY_IDENTITY
+                )
 
     return _check
 
@@ -8324,12 +8410,11 @@ def _register_from_host_pinned_surface_sync(
 ) -> List[str]:
     """Atomically publish the complete checked-in contract or no handlers."""
 
-    from tools.registry import registry
+    from tools.registry import no_cache_check_fn, registry
 
     _validate_mcp_surface(name, surface.tools, surface.capabilities, config)
     toolset_name = f"mcp-{name}"
     tool_timeout = _resolve_tool_timeout(config)
-    check_fn = _make_check_fn(name)
     candidates = []
     for tool in surface.tools:
         _scan_mcp_description(name, tool.name, tool.description or "")
@@ -8347,9 +8432,25 @@ def _register_from_host_pinned_surface_sync(
     candidate_names = {candidate[0] for candidate in candidates}
     if len(candidates) != 10 or candidate_names != expected_names:
         raise ValueError("checked-in Codex CUA registration set is not exact")
+    # The attestation is captured in the predicate closure, never attached to
+    # a public ToolEntry or callable attribute that a plugin can rewrite.
+    attestation = tuple(
+        (
+            tool_name,
+            handler,
+            json.dumps(schema, sort_keys=True, separators=(",", ":")),
+        )
+        for tool_name, schema, handler in candidates
+    )
+    # This predicate protects in-process security-policy coherence, not a slow
+    # external dependency. Never let the generic last-good grace cache mask a
+    # torn teardown or corrupted pinned-policy map.
+    check_fn = no_cache_check_fn(_make_check_fn(name, attestation))
 
     published: List[Tuple[str, Any]] = []
     with _coordinated_host_pinned_registry_transaction(registry):
+        if _mcp_shutting_down:
+            raise RuntimeError("cannot publish host-pinned tools during shutdown")
         alias_target = registry.get_toolset_alias_target(name)
         if alias_target is not None and alias_target != toolset_name:
             raise ValueError(
@@ -8620,7 +8721,11 @@ async def _discover_and_register_server(
             # Recoverable park: the run task deliberately stays alive to
             # self-probe, so adopt it into the registry for shutdown/revival.
             with _lock:
-                _servers[name] = server
+                shutting_down = _mcp_shutting_down
+                if not shutting_down:
+                    _servers[name] = server
+            if shutting_down:
+                await server.shutdown()
         elif server is not None:
             await server.shutdown()
         raise
@@ -8639,9 +8744,14 @@ async def _discover_and_register_server(
         raise
 
     with _lock:
-        _server_connecting.discard(name)
-        _server_connect_errors.pop(name, None)
-        _servers[name] = server
+        shutting_down = _mcp_shutting_down
+        if not shutting_down:
+            _server_connecting.discard(name)
+            _server_connect_errors.pop(name, None)
+            _servers[name] = server
+    if shutting_down:
+        await server.shutdown()
+        raise RuntimeError("MCP shutdown started during server discovery")
 
     if publish_tools:
         registered_names = _register_server_tools(name, server, config)
@@ -9486,18 +9596,224 @@ def shutdown_mcp_servers():
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
     """
+    global _mcp_shutting_down
     with _lock:
+        _mcp_shutting_down = True
         servers_snapshot = list(_servers.values())
 
-    def _release_writer_locks_after_disconnect() -> None:
-        with _single_writer_condition:
-            for _owner, cookie in _single_writer_process_locks.values():
-                cookie.release()
-            _single_writer_policies.clear()
-            _single_writer_capability_keys.clear()
-            _single_writer_leases.clear()
-            _single_writer_process_locks.clear()
-            _single_writer_condition.notify_all()
+    def _remove_pinned_publications_after_disconnect() -> None:
+        """Atomically retire host-pinned handlers and their security state.
+
+        This is intentionally local to the full shutdown path: plugins get no
+        separately targetable bulk-removal primitive.  The upstream loop is
+        already stopped before this runs, so successfully released OS flock
+        cookies are never restored as live lease metadata if rollback is
+        needed.  Lock order matches publication: registry, MCP state, writer.
+        """
+        from tools.registry import registry
+
+        with registry.registration_transaction():
+            with _lock, _single_writer_condition:
+                pinned_candidates = set(_pinned_lazy_server_configs)
+                pinned_candidates.update(_pinned_lazy_server_tool_names)
+                pinned_candidates.update(_mcp_server_capability_identities)
+                pinned_candidates.update(_mcp_tool_server_names.values())
+                registry_names_by_toolset: Dict[str, Dict[str, Any]] = {}
+                for entry in registry._tools.values():
+                    registry_names_by_toolset.setdefault(
+                        entry.toolset, {}
+                    )[entry.name] = entry
+                registry_pinned_candidates = set()
+                for toolset_name, registered_entries in (
+                    registry_names_by_toolset.items()
+                ):
+                    if not toolset_name.startswith("mcp-"):
+                        continue
+                    candidate = toolset_name[4:]
+                    canonical_names = {
+                        mcp_prefixed_tool_name(candidate, raw_name)
+                        for raw_name in _CODEX_CUA_TOOL_NAMES
+                    }
+                    if set(registered_entries) != canonical_names:
+                        continue
+                    check_fns = {
+                        entry.check_fn for entry in registered_entries.values()
+                    }
+                    if len(check_fns) != 1:
+                        continue
+                    check_fn = next(iter(check_fns))
+                    closure = getattr(check_fn, "__closure__", None) or ()
+                    freevars = getattr(
+                        getattr(check_fn, "__code__", None), "co_freevars", ()
+                    )
+                    closed = {
+                        key: cell.cell_contents
+                        for key, cell in zip(freevars, closure)
+                    }
+                    attestation = closed.get("pinned_attestation")
+                    if not isinstance(attestation, tuple):
+                        continue
+                    attested = {
+                        tool_name: (handler, schema_json)
+                        for tool_name, handler, schema_json in attestation
+                    }
+                    if set(attested) != canonical_names:
+                        continue
+                    if all(
+                        entry.handler is attested[tool_name][0]
+                        and json.dumps(
+                            entry.schema,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ) == attested[tool_name][1]
+                        for tool_name, entry in registered_entries.items()
+                    ):
+                        registry_pinned_candidates.add(candidate)
+                pinned_candidates.update(registry_pinned_candidates)
+                pinned_servers = {
+                    server_name for server_name in pinned_candidates
+                    if (
+                        server_name in _pinned_lazy_server_configs
+                        or server_name in _pinned_lazy_server_tool_names
+                        or _mcp_server_capability_identities.get(server_name)
+                        == _CODEX_CUA_CAPABILITY_IDENTITY
+                        or server_name in registry_pinned_candidates
+                    )
+                }
+                pinned_tool_names = {
+                    mcp_prefixed_tool_name(server_name, raw_name)
+                    for server_name in pinned_servers
+                    if (
+                        _mcp_server_capability_identities.get(server_name)
+                        == _CODEX_CUA_CAPABILITY_IDENTITY
+                        or server_name in _pinned_lazy_server_configs
+                        or server_name in _pinned_lazy_server_tool_names
+                        or server_name in registry_pinned_candidates
+                    )
+                    for raw_name in _CODEX_CUA_TOOL_NAMES
+                }
+                trust_before = dict(_server_trust_levels)
+                hints_before = {
+                    server: dict(hints)
+                    for server, hints in _tool_read_only_hints.items()
+                }
+                provenance_before = dict(_mcp_tool_server_names)
+                identities_before = dict(_mcp_server_capability_identities)
+                parallel_before = set(_parallel_safe_servers)
+                configs_before = {
+                    server: dict(server_config)
+                    for server, server_config
+                    in _pinned_lazy_server_configs.items()
+                }
+                names_before = {
+                    server: list(tool_names)
+                    for server, tool_names
+                    in _pinned_lazy_server_tool_names.items()
+                }
+                writer_policies_before = dict(_single_writer_policies)
+                writer_keys_before = dict(_single_writer_capability_keys)
+                connecting_before = set(_server_connecting)
+                errors_before = dict(_server_connect_errors)
+                try:
+                    if any(name in _servers for name in pinned_servers):
+                        raise RuntimeError(
+                            "host-pinned MCP transport survived shutdown"
+                        )
+                    # Release the account-global lifetime guard before its
+                    # policy is removed.  Shutdown owns every remaining lease;
+                    # once a cookie is released it must never be resurrected by
+                    # rollback as if the OS lock were still held.
+                    for _owner, cookie in list(
+                        _single_writer_process_locks.values()
+                    ):
+                        cookie.release()
+                    _single_writer_leases.clear()
+                    _single_writer_process_locks.clear()
+
+                    for tool_name in sorted(pinned_tool_names):
+                        registry._tools.pop(tool_name, None)
+                        for scope, entries in list(
+                            registry._scoped_tools.items()
+                        ):
+                            entries.pop(tool_name, None)
+                            if not entries:
+                                registry._scoped_tools.pop(scope, None)
+                    registry._generation += 1
+                    for server_name in pinned_servers:
+                        toolset_name = f"mcp-{server_name}"
+                        registry._toolset_checks.pop(toolset_name, None)
+                        registry._toolset_aliases = {
+                            alias: target
+                            for alias, target in registry._toolset_aliases.items()
+                            if alias != server_name and target != toolset_name
+                        }
+                    for server_name in pinned_servers:
+                        toolset_name = f"mcp-{server_name}"
+                        if any(
+                            entry.toolset == toolset_name
+                            for entry in registry._tools.values()
+                        ) or any(
+                            entry.toolset == toolset_name
+                            for entries in registry._scoped_tools.values()
+                            for entry in entries.values()
+                        ):
+                            raise RuntimeError(
+                                f"host-pinned MCP toolset '{server_name}' "
+                                "was not removed completely"
+                            )
+                        if registry.get_toolset_alias_target(server_name) is not None:
+                            raise RuntimeError(
+                                f"host-pinned MCP alias '{server_name}' "
+                                "was not removed completely"
+                            )
+
+                    for tool_name, server_name in list(
+                        _mcp_tool_server_names.items()
+                    ):
+                        if server_name in pinned_servers:
+                            _mcp_tool_server_names.pop(tool_name, None)
+                    for server_name in pinned_servers:
+                        _server_trust_levels.pop(server_name, None)
+                        _tool_read_only_hints.pop(server_name, None)
+                        _mcp_server_capability_identities.pop(server_name, None)
+                        _parallel_safe_servers.discard(server_name)
+                        _pinned_lazy_server_configs.pop(server_name, None)
+                        _pinned_lazy_server_tool_names.pop(server_name, None)
+                        _server_connecting.discard(server_name)
+                        _server_connect_errors.pop(server_name, None)
+                    _single_writer_policies.clear()
+                    _single_writer_capability_keys.clear()
+                    _single_writer_condition.notify_all()
+                except BaseException:
+                    _server_trust_levels.clear()
+                    _server_trust_levels.update(trust_before)
+                    _tool_read_only_hints.clear()
+                    _tool_read_only_hints.update(hints_before)
+                    _mcp_tool_server_names.clear()
+                    _mcp_tool_server_names.update(provenance_before)
+                    _mcp_server_capability_identities.clear()
+                    _mcp_server_capability_identities.update(identities_before)
+                    _parallel_safe_servers.clear()
+                    _parallel_safe_servers.update(parallel_before)
+                    _pinned_lazy_server_configs.clear()
+                    _pinned_lazy_server_configs.update(configs_before)
+                    _pinned_lazy_server_tool_names.clear()
+                    _pinned_lazy_server_tool_names.update(names_before)
+                    _single_writer_policies.clear()
+                    _single_writer_policies.update(writer_policies_before)
+                    _single_writer_capability_keys.clear()
+                    _single_writer_capability_keys.update(writer_keys_before)
+                    _server_connecting.clear()
+                    _server_connecting.update(connecting_before)
+                    _server_connect_errors.clear()
+                    _server_connect_errors.update(errors_before)
+                    # Never restore leases or cookie objects: release() is an
+                    # irreversible OS action, and stale ownership metadata
+                    # would let an old task appear to hold a lock it does not.
+                    _single_writer_leases.clear()
+                    _single_writer_process_locks.clear()
+                    _single_writer_condition.notify_all()
+                    raise
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
@@ -9510,7 +9826,11 @@ def shutdown_mcp_servers():
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
         _stop_mcp_loop()
-        _release_writer_locks_after_disconnect()
+        try:
+            _remove_pinned_publications_after_disconnect()
+        finally:
+            with _lock:
+                _mcp_shutting_down = False
         return
 
     async def _shutdown():
@@ -9558,7 +9878,11 @@ def shutdown_mcp_servers():
     # The account-global capability lock is the outermost lifetime guard.
     # Release it only after every upstream transport has been torn down and
     # the loop can no longer reconnect one behind our back.
-    _release_writer_locks_after_disconnect()
+    try:
+        _remove_pinned_publications_after_disconnect()
+    finally:
+        with _lock:
+            _mcp_shutting_down = False
 
 
 def _kill_orphaned_mcp_children(

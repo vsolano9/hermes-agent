@@ -200,6 +200,333 @@ def test_static_registration_never_uses_writable_schema_cache() -> None:
     loop.assert_not_called()
 
 
+def test_static_publication_is_model_visible_without_upstream_connection() -> None:
+    registry = ToolRegistry()
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+         patch("tools.mcp_tool._ensure_mcp_loop") as loop, \
+         patch("tools.mcp_tool._run_on_mcp_loop") as upstream:
+        names = mcp_tool.register_mcp_servers(
+            {"codex-computer-use": _config()}
+        )
+        definitions = registry.get_definitions(set(names), quiet=True)
+
+    assert len(names) == 10
+    assert {item["function"]["name"] for item in definitions} == set(names)
+    assert mcp_tool._servers == {}
+    loop.assert_not_called()
+    upstream.assert_not_called()
+
+
+def test_shutdown_and_reload_republish_exact_model_visible_surface() -> None:
+    registry = ToolRegistry()
+    alias = "reloadable-cua"
+    toolset = f"mcp-{alias}"
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+         patch("tools.mcp_tool._ensure_mcp_loop") as loop, \
+         patch("tools.mcp_tool._run_on_mcp_loop") as upstream:
+        first_names = mcp_tool.register_mcp_servers({alias: _config()})
+        assert len(registry.get_definitions(set(first_names), quiet=True)) == 10
+
+        mcp_tool.shutdown_mcp_servers()
+
+        assert registry.get_tool_names_for_toolset(toolset) == []
+        assert registry.get_toolset_alias_target(alias) is None
+        assert alias not in mcp_tool._pinned_lazy_server_configs
+        assert alias not in mcp_tool._pinned_lazy_server_tool_names
+        assert alias not in mcp_tool._server_trust_levels
+        assert alias not in mcp_tool._tool_read_only_hints
+        assert alias not in mcp_tool._mcp_server_capability_identities
+        assert alias not in mcp_tool._parallel_safe_servers
+        assert alias not in mcp_tool._single_writer_policies
+        assert alias not in mcp_tool._single_writer_capability_keys
+        assert alias not in mcp_tool._single_writer_leases
+        assert alias not in mcp_tool._single_writer_process_locks
+        assert not any(
+            server_name == alias
+            for server_name in mcp_tool._mcp_tool_server_names.values()
+        )
+
+        second_names = mcp_tool.register_mcp_servers({alias: _config()})
+        second_definitions = registry.get_definitions(
+            set(second_names), quiet=True
+        )
+
+    assert len(second_names) == 10
+    assert {item["function"]["name"] for item in second_definitions} == set(
+        second_names
+    )
+    assert mcp_tool._single_writer_policies[alias] == (90.0, 10.0)
+    assert mcp_tool._single_writer_capability_keys[alias] == (
+        mcp_tool._CODEX_CUA_CAPABILITY_IDENTITY
+    )
+    assert mcp_tool._servers == {}
+    loop.assert_not_called()
+    upstream.assert_not_called()
+
+
+@pytest.mark.parametrize("reload_mode", ["removed", "disabled"])
+def test_shutdown_reload_without_enabled_pinned_server_leaves_no_surface(
+    reload_mode: str,
+) -> None:
+    registry = ToolRegistry()
+    alias = "reload-disabled-cua"
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+         patch("tools.mcp_tool._ensure_mcp_loop") as loop, \
+         patch("tools.mcp_tool._run_on_mcp_loop") as upstream:
+        names = mcp_tool.register_mcp_servers({alias: _config()})
+        assert len(names) == 10
+        mcp_tool.shutdown_mcp_servers()
+
+        if reload_mode == "disabled":
+            disabled = _config()
+            disabled["enabled"] = False
+            assert mcp_tool.register_mcp_servers({alias: disabled}) == []
+
+        assert registry.get_tool_names_for_toolset(f"mcp-{alias}") == []
+        assert registry.get_toolset_alias_target(alias) is None
+        assert alias not in mcp_tool._pinned_lazy_server_configs
+        assert alias not in mcp_tool._pinned_lazy_server_tool_names
+        assert not any(
+            server_name == alias
+            for server_name in mcp_tool._mcp_tool_server_names.values()
+        )
+        assert mcp_tool._servers == {}
+
+    loop.assert_not_called()
+    upstream.assert_not_called()
+
+
+def test_shutdown_publication_removal_is_atomic_to_registry_readers() -> None:
+    registry = ToolRegistry()
+    alias = "atomic-shutdown-cua"
+    first_removal = threading.Event()
+    reader_started = threading.Event()
+    reader_finished = threading.Event()
+    observed = []
+    errors = []
+    class PausingTools(dict):
+        def pop(self, tool_name, default=None):
+            result = super().pop(tool_name, default)
+            if not first_removal.is_set():
+                first_removal.set()
+                assert reader_started.wait(timeout=5)
+                reader_finished.wait(timeout=0.25)
+            return result
+
+    def shutdown() -> None:
+        try:
+            mcp_tool.shutdown_mcp_servers()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def read() -> None:
+        try:
+            assert first_removal.wait(timeout=5)
+            reader_started.set()
+            observed.append((
+                len(registry.get_tool_names_for_toolset(f"mcp-{alias}")),
+                registry.get_toolset_alias_target(alias),
+            ))
+            reader_finished.set()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        assert len(mcp_tool.register_mcp_servers({alias: _config()})) == 10
+        registry._tools = PausingTools(registry._tools)
+        shutdown_thread = threading.Thread(target=shutdown)
+        reader_thread = threading.Thread(target=read)
+        shutdown_thread.start()
+        reader_thread.start()
+        shutdown_thread.join(timeout=10)
+        reader_thread.join(timeout=10)
+
+    assert not shutdown_thread.is_alive()
+    assert not reader_thread.is_alive()
+    assert errors == []
+    assert observed == [(0, None)]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "alias", "handler", "schema", "trust", "hints", "identity", "provenance",
+        "policy", "key",
+    ],
+)
+def test_static_availability_fails_closed_on_companion_state_drift(
+    mutation: str,
+) -> None:
+    registry = ToolRegistry()
+    alias = "availability-drift-cua"
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        names = mcp_tool.register_mcp_servers({alias: _config()})
+        assert len(registry.get_definitions(set(names), quiet=True)) == 10
+
+        if mutation == "alias":
+            with registry.registration_transaction():
+                registry._toolset_aliases.pop(alias, None)
+        elif mutation == "handler":
+            registry.get_entry(names[0]).handler = lambda _args: "replaced"
+        elif mutation == "schema":
+            registry.get_entry(names[0]).schema["description"] = "injected"
+        elif mutation == "trust":
+            mcp_tool._server_trust_levels[alias] = "full"
+        elif mutation == "hints":
+            mcp_tool._tool_read_only_hints[alias] = {}
+        elif mutation == "identity":
+            mcp_tool._mcp_server_capability_identities[alias] = "ordinary"
+        elif mutation == "provenance":
+            mcp_tool._mcp_tool_server_names.pop(names[0], None)
+        elif mutation == "policy":
+            mcp_tool._single_writer_policies.pop(alias, None)
+        else:
+            mcp_tool._single_writer_capability_keys.pop(alias, None)
+
+        assert registry.get_definitions(set(names), quiet=True) == []
+
+
+def test_connected_pinned_availability_still_requires_exact_policy() -> None:
+    registry = ToolRegistry()
+    alias = "connected-availability-cua"
+    connected = SimpleNamespace(
+        session=object(), _is_recycled_stdio=lambda: False,
+    )
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        names = mcp_tool.register_mcp_servers({alias: _config()})
+        mcp_tool._servers[alias] = connected
+        assert len(registry.get_definitions(set(names), quiet=True)) == 10
+
+        mcp_tool._single_writer_policies.pop(alias, None)
+
+        assert registry.get_definitions(set(names), quiet=True) == []
+
+
+def test_shutdown_gate_blocks_visibility_and_new_pinned_connection() -> None:
+    registry = ToolRegistry()
+    alias = "shutdown-gate-cua"
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        names = mcp_tool.register_mcp_servers({alias: _config()})
+        mcp_tool._mcp_shutting_down = True
+        try:
+            assert registry.get_definitions(set(names), quiet=True) == []
+            assert not mcp_tool._ensure_pinned_server_connected(alias)
+            assert mcp_tool._get_connected_server_for_call(alias) is None
+        finally:
+            mcp_tool._mcp_shutting_down = False
+
+
+def test_shutdown_cleanup_failure_rolls_back_publication_without_stale_lease() -> None:
+    registry = ToolRegistry()
+    alias = "rollback-shutdown-cua"
+    calls = 0
+    releases = []
+
+    class Cookie:
+        def release(self) -> None:
+            releases.append("released")
+
+    class FailingTools(dict):
+        def pop(self, tool_name, default=None):
+            nonlocal calls
+            calls += 1
+            result = super().pop(tool_name, default)
+            if calls == 2:
+                raise RuntimeError("injected shutdown cleanup failure")
+            return result
+
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        names = mcp_tool.register_mcp_servers({alias: _config()})
+        mcp_tool._single_writer_leases[alias] = ("stale-owner", 1.0)
+        mcp_tool._single_writer_process_locks[alias] = (
+            "stale-owner", Cookie(),
+        )
+        registry._tools = FailingTools(registry._tools)
+        with pytest.raises(RuntimeError, match="injected shutdown cleanup failure"):
+            mcp_tool.shutdown_mcp_servers()
+
+        assert registry.get_tool_names_for_toolset(f"mcp-{alias}") == sorted(
+            names
+        )
+        assert registry.get_toolset_alias_target(alias) == f"mcp-{alias}"
+        assert len(registry.get_definitions(set(names), quiet=True)) == 10
+        assert mcp_tool._single_writer_policies[alias] == (90.0, 10.0)
+        assert mcp_tool._single_writer_capability_keys[alias] == (
+            mcp_tool._CODEX_CUA_CAPABILITY_IDENTITY
+        )
+        assert alias not in mcp_tool._single_writer_leases
+        assert alias not in mcp_tool._single_writer_process_locks
+        assert releases == ["released"]
+
+
+def test_shutdown_uses_canonical_names_despite_stale_ledger_and_scope() -> None:
+    registry = ToolRegistry()
+    alias = "stale-ledger-cua"
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        names = mcp_tool.register_mcp_servers({alias: _config()})
+        hidden_name = names[0]
+        mcp_tool._pinned_lazy_server_tool_names[alias].remove(hidden_name)
+        registry._scoped_tools[registry.current_scope_key()] = {
+            hidden_name: registry.get_entry(hidden_name)
+        }
+
+        mcp_tool.shutdown_mcp_servers()
+
+        assert hidden_name not in registry._tools
+        assert not any(
+            hidden_name in entries
+            for entries in registry._scoped_tools.values()
+        )
+        assert hidden_name not in mcp_tool._mcp_tool_server_names
+        assert registry.get_toolset_alias_target(alias) is None
+
+
+def test_shutdown_recovers_exact_surface_with_all_companion_maps_lost() -> None:
+    registry = ToolRegistry()
+    alias = "registry-only-cua"
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        names = mcp_tool.register_mcp_servers({alias: _config()})
+        mcp_tool._pinned_lazy_server_configs.clear()
+        mcp_tool._pinned_lazy_server_tool_names.clear()
+        mcp_tool._server_trust_levels.clear()
+        mcp_tool._tool_read_only_hints.clear()
+        mcp_tool._mcp_server_capability_identities.clear()
+        mcp_tool._mcp_tool_server_names.clear()
+        mcp_tool._single_writer_policies.clear()
+        mcp_tool._single_writer_capability_keys.clear()
+
+        mcp_tool.shutdown_mcp_servers()
+
+        assert not any(registry.snapshot_registration(name) for name in names)
+        assert registry.get_toolset_alias_target(alias) is None
+
+
+def test_shutdown_does_not_misclassify_ordinary_cua_like_tool_name() -> None:
+    registry = ToolRegistry()
+    name = "mcp__ordinary__click"
+    registry.register(
+        name=name,
+        toolset="mcp-ordinary",
+        schema={"name": name, "description": "ordinary", "parameters": {}},
+        handler=lambda _args: "ordinary",
+    )
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True):
+        mcp_tool.shutdown_mcp_servers()
+
+    assert registry.snapshot_registration(name) is not None
+
+
 def test_static_publication_collision_rolls_back_every_new_handler() -> None:
     registry = ToolRegistry()
     occupied = "mcp__renamed_cua__click"
@@ -1209,6 +1536,71 @@ def test_dispatch_acquires_writer_before_first_upstream_connect() -> None:
 
     assert order == ["lease", "connect"]
     assert "not connected" in result
+
+
+def test_first_pinned_list_apps_call_serializes_and_disconnects_before_unlock(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import asyncio
+
+    registry = ToolRegistry()
+    alias = "first-call-cua"
+    observed = []
+
+    class Session:
+        async def call_tool(self, tool_name, arguments):
+            assert tool_name == "list_apps"
+            assert arguments == {}
+            return SimpleNamespace(
+                content=[SimpleNamespace(text="[]")],
+                is_error=False,
+                structured_content=None,
+                meta=None,
+            )
+
+    class Server:
+        def __init__(self):
+            self.session = Session()
+            self._rpc_lock = asyncio.Lock()
+            self._inflight_tasks = set()
+            self._reconnecting = False
+            self._pending_call_context = None
+
+        async def shutdown(self):
+            observed.append(
+                mcp_tool._acquire_single_writer_lease(
+                    alias, "second-owner", wait_timeout_seconds=0,
+                )
+            )
+            self.session = None
+
+    monkeypatch.setattr(
+        mcp_tool, "_machine_account_home_for_lock", lambda: tmp_path
+    )
+    server = Server()
+    with patch("tools.registry.registry", registry), \
+         patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+         patch(
+             "tools.mcp_tool._run_on_mcp_loop",
+             side_effect=lambda factory, **_kwargs: asyncio.run(factory()),
+         ):
+        names = mcp_tool.register_mcp_servers({alias: _config()})
+        list_apps = next(name for name in names if name.endswith("__list_apps"))
+        mcp_tool._servers[alias] = server
+
+        result = registry.dispatch(list_apps, {}, task_id="first-owner")
+        assert result == '{"result": "[]"}'
+        assert not mcp_tool._acquire_single_writer_lease(
+            alias, "second-owner", wait_timeout_seconds=0,
+        )
+
+        mcp_tool.release_mcp_single_writer_leases("first-owner")
+        assert observed == [False]
+        assert alias not in mcp_tool._servers
+        assert mcp_tool._acquire_single_writer_lease(
+            alias, "second-owner", wait_timeout_seconds=0,
+        )
+        mcp_tool.release_mcp_single_writer_leases("second-owner")
 
 
 def test_reconnect_cannot_replace_host_pinned_handlers() -> None:
