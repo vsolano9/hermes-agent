@@ -20,6 +20,7 @@ def test_anthropic_curated_alias_survives_when_live_omits_it():
     """A curated alias missing from /v1/models still surfaces (first)."""
     curated = M._PROVIDER_MODELS["anthropic"]
     assert "claude-fable-5" in curated  # sanity: the alias is curated
+    assert "claude-opus-5" in curated
     assert "claude-sonnet-5" in curated  # newest Sonnet alias is curated
 
     # Live catalog the API would actually return — no fable-5.
@@ -28,6 +29,7 @@ def test_anthropic_curated_alias_survives_when_live_omits_it():
         result = M.provider_model_ids("anthropic")
 
     assert "claude-fable-5" in result
+    assert "claude-opus-5" in result
     assert "claude-sonnet-5" in result
     # Curated order is preserved at the front.
     assert result[:len(curated)] == list(curated)

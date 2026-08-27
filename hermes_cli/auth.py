@@ -1945,7 +1945,8 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     Checks:
       1. active_provider in auth.json matches
       2. model.provider in config.yaml matches
-      3. Provider-specific env vars are set (e.g. ANTHROPIC_API_KEY)
+      3. fallback or MoA routes in config.yaml match
+      4. Provider-specific env vars are set (e.g. ANTHROPIC_API_KEY)
 
     This is used to gate auto-discovery of external credentials (e.g.
     Claude Code's ~/.claude/.credentials.json) so they are never used
@@ -1971,6 +1972,13 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         if isinstance(model_cfg, dict):
             cfg_provider = (model_cfg.get("provider") or "").strip().lower()
             if cfg_provider == normalized:
+                return True
+
+        for fallback in cfg.get("fallback_providers") or []:
+            if (
+                isinstance(fallback, dict)
+                and (fallback.get("provider") or "").strip().lower() == normalized
+            ):
                 return True
 
         # MoA presets are explicit model selections too.  A user who configured

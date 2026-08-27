@@ -167,6 +167,26 @@ def test_returns_true_when_moa_reference_slot_uses_provider(tmp_path, monkeypatc
     assert is_provider_explicitly_configured("anthropic") is True
 
 
+def test_returns_true_when_fallback_uses_provider(tmp_path, monkeypatch):
+    """Fallback routes are explicit provider selections for auth gating."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_config(tmp_path, {
+        "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+        "fallback_providers": [
+            {"provider": "anthropic", "model": "claude-opus-5"},
+            {"provider": "xai-oauth", "model": "grok-4.6"},
+        ],
+    })
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "providers": {},
+        "active_provider": "openai-codex",
+    })
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+    assert is_provider_explicitly_configured("anthropic") is True
+
+
 def test_stale_env_pool_entry_does_not_count_when_var_unset(tmp_path, monkeypatch):
     """An env-seeded pool entry left in auth.json after the env var was removed
     must not mark the provider configured (#55790): the picker showed removed
